@@ -147,6 +147,8 @@ impl ModalScroll {
             KeyCode::Down => self.scroll(-1),
             _ if key::SCROLL_HALF_UP.matches(key_event) => self.scroll(self.half_page()),
             _ if key::SCROLL_HALF_DOWN.matches(key_event) => self.scroll(-self.half_page()),
+            _ if key::SCROLL_PAGE_UP.matches(key_event) => self.scroll(self.page()),
+            _ if key::SCROLL_PAGE_DOWN.matches(key_event) => self.scroll(-self.page()),
             _ if key::SCROLL_LINE_UP.matches(key_event) => self.scroll(1),
             _ if key::SCROLL_LINE_DOWN.matches(key_event) => self.scroll(-1),
             _ if key::SCROLL_TOP.matches(key_event) => {
@@ -164,6 +166,10 @@ impl ModalScroll {
 
     fn half_page(&self) -> i32 {
         (self.viewport_h / 2).max(1) as i32
+    }
+
+    fn page(&self) -> i32 {
+        self.viewport_h.max(1) as i32
     }
 
     fn clamp(&mut self) {

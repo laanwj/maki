@@ -1509,6 +1509,8 @@ fn cancelling_from_inside_a_subagent_reports_error() {
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
     kb::SCROLL_HALF_UP.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
+    kb::SCROLL_PAGE_UP.to_key_event(),
+    kb::SCROLL_PAGE_DOWN.to_key_event(),
     kb::HELP.to_key_event(),
 ];
 
@@ -1548,6 +1550,42 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
         app.chats[app.active_chat].scroll_pos(),
         scroll_before,
         "scroll changed through overlay"
+    );
+}
+
+#[test]
+fn page_keys_scroll_the_transcript_by_one_page() {
+    let area = Rect::new(0, 0, 80, 20);
+    let mut app = app_with_transcript(area);
+    let start = app.active_chat().win_view();
+    assert!(
+        start.scroll_top > 0,
+        "the transcript must overflow the viewport for this to prove anything"
+    );
+
+    app.update(Msg::Key(kb::SCROLL_PAGE_UP.to_key_event()));
+    let up = app.active_chat().win_view();
+    assert_eq!(
+        start.scroll_top - up.scroll_top,
+        u32::from(start.height),
+        "page up moves the viewport up by one page"
+    );
+    assert!(!up.auto_scroll, "page up unpins the transcript");
+
+    app.update(Msg::Key(kb::SCROLL_PAGE_DOWN.to_key_event()));
+    let backend = ratatui::backend::TestBackend::new(area.width, area.bottom());
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| app.active_chat().view(frame, area, false))
+        .unwrap();
+    let down = app.active_chat().win_view();
+    assert_eq!(
+        down.scroll_top, start.scroll_top,
+        "page down lands back on the bottom"
+    );
+    assert!(
+        down.auto_scroll,
+        "landing on the bottom re-pins the transcript"
     );
 }
 

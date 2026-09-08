@@ -242,6 +242,7 @@ pub struct Session<M, U, T> {
 pub struct SessionSummary {
     pub id: MakiId,
     pub title: String,
+    pub cwd: String,
     pub updated_at: u64,
 }
 
@@ -1178,7 +1179,7 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
     Some((meta.len(), mtime_ms))
 }
 
-fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
+fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
     let mut cache = load_scan_cache(dir);
     let mut fresh = ScanCache::new();
     let mut dirty = false;
@@ -1207,11 +1208,12 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
             }
         };
         if let Some(h) = &entry.header
-            && h.cwd == cwd
+            && cwd.is_none_or(|c| h.cwd == c)
         {
             out.push(SessionSummary {
                 id: h.id,
                 title: normalize_title(&h.title),
+                cwd: h.cwd.clone(),
                 updated_at: h.updated_at,
             });
         }
@@ -1655,7 +1657,18 @@ where
     }
 
     pub fn list_in(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
-        let mut summaries = scan_headers(cwd, dir)?;
+        let mut summaries = scan_headers(Some(cwd), dir)?;
+        summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
+        Ok(summaries)
+    }
+
+    pub fn list_all(dir: &StateDir) -> Result<Vec<SessionSummary>, SessionError> {
+        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
+        Self::list_all_in(&sessions_dir)
+    }
+
+    pub fn list_all_in(dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut summaries = scan_headers(None, dir)?;
         summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
         Ok(summaries)
     }
@@ -1682,7 +1695,7 @@ where
             }
         }
 
-        scan_headers(cwd, dir)?
+        scan_headers(Some(cwd), dir)?
             .into_iter()
             .max_by_key(|s| s.updated_at)
             .map(|s| Self::load_from(s.id, dir).map(Some))
@@ -2498,7 +2511,28 @@ mod tests {
 
         let list = TestSession::list_in("/project-a", dir).unwrap();
         assert_eq!(list.len(), 2);
-        assert!(list.iter().all(|s| s.id != s2.id));
+        assert!(list.iter().all(|s| s.id != s2.id && s.cwd == "/project-a"));
+    }
+
+    #[test]
+    fn list_all_spans_cwds_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // `SessionLog::rewrite` persists `updated_at` verbatim; `save_to`
+        // would stamp both sessions with the same wall-clock second.
+        let mut older: TestSession = Session::new("m", "/project-a");
+        older.updated_at = 100;
+        SessionLog::rewrite(dir, &older).unwrap();
+        let mut newer: TestSession = Session::new("m", "/project-b");
+        newer.updated_at = 200;
+        SessionLog::rewrite(dir, &newer).unwrap();
+
+        let list = TestSession::list_all_in(dir).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, newer.id);
+        assert_eq!(list[0].cwd, "/project-b");
+        assert_eq!(list[1].id, older.id);
+        assert_eq!(list[1].cwd, "/project-a");
     }
 
     /// Rewrites the scan-cache title of `id` without touching the session

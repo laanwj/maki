@@ -95,6 +95,16 @@ maki auth status
 
 Lists every model Maki currently knows about (built-ins, discovered, catalog). One model spec per line. Warnings from discovery go to stderr.
 
+### `maki session`
+
+```bash
+maki session list            # sessions for the current directory
+maki session list --global   # sessions from all projects
+maki session delete <id>     # no confirmation
+```
+
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --session <id>` to resume it. `delete` removes the session log along with its archives and index entries. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+
 ### `maki mcp`
 
 ```bash

@@ -39,6 +39,7 @@ libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

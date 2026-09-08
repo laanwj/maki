@@ -44,6 +44,12 @@ use maki_storage::id::MakiId;
 
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
+/// Width of the controlling terminal, if any. Answers even when stdout is
+/// redirected, so callers that care gate on [`std::io::IsTerminal`].
+pub fn terminal_width() -> Option<u16> {
+    crossterm::terminal::size().ok().map(|(w, _)| w)
+}
+
 pub(crate) use agent::AgentCommand;
 pub use event_loop::EventLoopParams;
 

@@ -1,5 +1,6 @@
 mod acp;
 mod migrate;
+mod session;
 mod subcmd;
 mod tui;
 
@@ -10,7 +11,7 @@ use maki_config::Config;
 use maki_lua::{DiscoveredPackage, Interaction, PluginHost};
 use maki_storage::StateDir;
 
-use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
+use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction};
 use crate::update;
 
 fn sanitize_warnings(warnings: &[String]) -> Vec<String> {
@@ -129,6 +130,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             subcmd::index(&path, cli.no_plugins, cli.no_jit)?;
         }
         Some(Command::Models) => subcmd::models(cli.no_plugins, cli.no_jit)?,
+        Some(Command::Session { action }) => {
+            let storage = StateDir::resolve().context("resolve data directory")?;
+            match action {
+                SessionAction::List { global } => session::list(global, &storage)?,
+                SessionAction::Delete { session_id } => session::delete(&session_id, &storage)?,
+            }
+        }
         Some(Command::Mcp { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {

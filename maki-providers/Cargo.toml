@@ -22,6 +22,7 @@ hmac = { workspace = true }
 wait-timeout = { workspace = true }
 fastrand = { workspace = true }
 maki-config = { workspace = true }
+async-lock = { workspace = true }
 inventory = { workspace = true }
 jiff = { workspace = true }
 getrandom = { workspace = true }

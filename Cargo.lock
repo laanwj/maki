@@ -2921,6 +2921,7 @@ dependencies = [
 name = "maki-providers"
 version = "0.5.3"
 dependencies = [
+ "async-lock",
  "base64 0.22.1",
  "fastrand",
  "flume 0.11.1",

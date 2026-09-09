@@ -223,6 +223,7 @@ supports_vision = false
 | `default_model` | string | Used after login when no model is saved yet |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
+| `max_contexts` | usize | unset | Max concurrent active contexts/turns for this provider. Set to `1` for local inference servers that can host only one loaded context at a time |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 

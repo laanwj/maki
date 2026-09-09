@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
+use crate::context_limit::LimitedProvider;
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
@@ -335,10 +336,11 @@ fn provider_available_offline(slug: &str) -> bool {
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    let provider = provider_for_slug(&model.provider, timeouts)?;
+    let slug = model.provider.clone();
+    let provider = provider_for_slug(&slug, timeouts)?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
-    Ok(provider)
+    Ok(LimitedProvider::wrap(provider, &slug))
 }
 
 /// Adjust a model against its provider's static table without retaining the
@@ -405,7 +407,7 @@ pub async fn from_model_async(
     let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
-    Ok(provider)
+    Ok(LimitedProvider::wrap(provider, &model.provider))
 }
 
 pub struct ModelBatch {

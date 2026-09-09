@@ -322,6 +322,11 @@ pub struct ProviderDef {
     pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
+    /// Max concurrent contexts/turns for this provider. `None` means no limit.
+    /// Use this for local inference servers that can only keep one model
+    /// context loaded at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_contexts: Option<usize>,
     /// Extra HTTP headers sent with every request to this provider. Values
     /// expand `${VAR}` from the environment, so gateway credentials (e.g.
     /// Cloudflare Access service tokens in front of a private endpoint) never
@@ -743,6 +748,7 @@ mod tests {
                 api_key_env: Some("MY_API_KEY".into()),
                 discover_models: true,
                 enable_free_models: Some(false),
+                max_contexts: Some(1),
                 ..Default::default()
             },
         );
@@ -760,6 +766,7 @@ mod tests {
             parsed.get("my-provider").unwrap().enable_free_models,
             Some(false)
         );
+        assert_eq!(parsed.get("my-provider").unwrap().max_contexts, Some(1));
     }
 
     const EMPTY_PROVIDER_DEF_TOML: &str = "";

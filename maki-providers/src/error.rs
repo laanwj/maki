@@ -412,6 +412,21 @@ impl AgentError {
         }
     }
 
+    /// The message with every source appended. The transport errors that
+    /// retry forever are the ones whose Display says the least: isahc prints
+    /// only its coarse kind ("unknown error") and keeps the curl cause in
+    /// `source()`.
+    pub fn chain(&self) -> String {
+        let mut chain = self.to_string();
+        let mut source = std::error::Error::source(self);
+        while let Some(cause) = source {
+            chain.push_str(": ");
+            chain.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        chain
+    }
+
     pub fn retry_message(&self) -> String {
         if let Some(error) = self.non_login_error() {
             return error.message;
@@ -476,6 +491,7 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::{collections::HashSet, mem::discriminant};
 
     use maki_config::DEFAULT_MAX_RETRIES;
@@ -504,6 +520,44 @@ mod tests {
 
     fn api_msg(status: u16, message: &str) -> AgentError {
         AgentError::api(status, message)
+    }
+
+    const WRAPPER_MESSAGE: &str = "request failed";
+    const ROOT_MESSAGE: &str = "connection reset by peer";
+
+    #[derive(Debug)]
+    struct RootCause;
+
+    impl fmt::Display for RootCause {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(ROOT_MESSAGE)
+        }
+    }
+
+    impl std::error::Error for RootCause {}
+
+    #[derive(Debug)]
+    struct Wrapper;
+
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(WRAPPER_MESSAGE)
+        }
+    }
+
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&RootCause)
+        }
+    }
+
+    #[test]
+    fn the_chain_carries_what_the_display_hides() {
+        let error = AgentError::from(io::Error::new(io::ErrorKind::ConnectionReset, Wrapper));
+        // An io error displays and sources straight through the error it
+        // wraps, so the wrapper's message appears once; the value is in what
+        // follows it.
+        assert_eq!(error.chain(), format!("{WRAPPER_MESSAGE}: {ROOT_MESSAGE}"));
     }
 
     const SUMMARY_BODY: &str = r#"{"error":{"message":"Your organization must be verified to generate reasoning summaries.","param":"reasoning.summary","code":"unsupported_value"}}"#;

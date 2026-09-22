@@ -92,6 +92,7 @@ fn provider_available_offline(slug: &str) -> bool {
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     let slug = model.provider.clone();
     let provider = provider_for_slug(&slug, timeouts)?;
+    model.max_image_bytes = timeouts.max_image_bytes;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(LimitedProvider::wrap(provider, &slug))
@@ -101,6 +102,7 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
 /// provider. Used to reconcile a resumed model so it matches one started
 /// fresh (e.g. inherited thinking support for a routed Aperture model).
 pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
+    model.max_image_bytes = timeouts.max_image_bytes;
     provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
     Ok(())
 }
@@ -153,6 +155,7 @@ pub async fn from_model_async(
     let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
     let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
+    model.max_image_bytes = timeouts.max_image_bytes;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
     Ok(LimitedProvider::wrap(provider, &model.provider))

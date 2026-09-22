@@ -1526,6 +1526,7 @@ data: [DONE]\n";
             turn_output_tokens: None,
             context_window: 131_072,
             thinking_fields: None,
+            max_image_bytes: maki_config::DEFAULT_MAX_REQUEST_IMAGE_BYTES,
         }
     }
 

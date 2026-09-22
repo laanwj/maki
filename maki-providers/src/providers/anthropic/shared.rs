@@ -646,6 +646,7 @@ mod tests {
             turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
+            max_image_bytes: maki_config::DEFAULT_MAX_REQUEST_IMAGE_BYTES,
         }
     }
 

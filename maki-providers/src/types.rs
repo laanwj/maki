@@ -140,6 +140,9 @@ pub const IMAGE_UNUSABLE_NOTE: &str = "[image omitted: the image could not be de
 /// Past [`MAX_IMAGES`] the request itself is refused, so the oldest pixels
 /// make way rather than taking the whole session down.
 pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this conversation]";
+/// Past the request's image byte budget ([`Model::max_image_bytes`]) the
+/// request itself is refused, so the oldest pixels make way here too.
+pub const IMAGE_BUDGET_NOTE: &str = "[image omitted: too much image data in this conversation]";
 /// Stands in for the text of a message that carries only images, both in model
 /// context and in the transcript. One const so the two can never drift apart.
 pub const IMAGE_PLACEHOLDER: &str = "[image]";
@@ -152,10 +155,21 @@ pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 /// switching back to a vision-capable model restores them. For the rest,
 /// oversized payloads are rewritten to fit provider limits, because one image
 /// a provider refuses would otherwise fail every later request in the session
-/// too.
+/// too. Survivors also share one byte budget for the whole request, since a
+/// body past the server's size limit fails every turn the same way.
 pub async fn adapt_images_for_model<'a>(
     model: &Model,
     messages: &'a [Message],
+) -> Cow<'a, [Message]> {
+    adapt_images_within(model, messages, model.max_image_bytes).await
+}
+
+/// The budget is a parameter so tests can spend it on a handful of tiny
+/// images instead of building tens of megabytes of pixels.
+async fn adapt_images_within<'a>(
+    model: &Model,
+    messages: &'a [Message],
+    max_image_bytes: usize,
 ) -> Cow<'a, [Message]> {
     // Newest first: the stale screenshots are the ones a long session can
     // spare once the request runs out of room for them. Collected rather than
@@ -181,8 +195,11 @@ pub async fn adapt_images_for_model<'a>(
     let vision = model.supports_vision();
     let mut edits: Vec<(usize, usize, ContentBlock)> = Vec::new();
     // Counts survivors, not blocks, or an image nobody can read would cost a
-    // good one its place. Nothing past the cap is decoded at all.
+    // good one its place. Nothing past the cap is decoded at all. The byte
+    // budget can spend a decode on an image it then cannot carry, but the
+    // cached verdict pays for that once per session.
     let mut kept = 0;
+    let mut budget = max_image_bytes;
     for (m, b, source) in images {
         if !vision {
             edits.push((m, b, note(IMAGE_OMITTED_NOTE)));
@@ -190,12 +207,19 @@ pub async fn adapt_images_for_model<'a>(
             edits.push((m, b, note(IMAGE_EVICTED_NOTE)));
         } else {
             match fix_for_wire(&source).await {
-                Fix::Keep => kept += 1,
-                Fix::Replace(source) => {
+                Fix::Keep if source.data.len() <= budget => {
+                    budget -= source.data.len();
                     kept += 1;
-                    edits.push((m, b, ContentBlock::Image { source }));
+                }
+                Fix::Replace(fixed) if fixed.data.len() <= budget => {
+                    budget -= fixed.data.len();
+                    kept += 1;
+                    edits.push((m, b, ContentBlock::Image { source: fixed }));
                 }
                 Fix::Drop => edits.push((m, b, note(IMAGE_UNUSABLE_NOTE))),
+                // One image over the remaining budget is skipped, not a wall:
+                // an older, smaller one may still fit.
+                _ => edits.push((m, b, note(IMAGE_BUDGET_NOTE))),
             }
         }
     }
@@ -1291,6 +1315,17 @@ mod tests {
             .clone()
     }
 
+    fn adapt_within(model: &Model, content: Vec<ContentBlock>, budget: usize) -> Vec<ContentBlock> {
+        let messages = vec![Message {
+            role: Role::User,
+            content,
+            ..Default::default()
+        }];
+        smol::block_on(adapt_images_within(model, &messages, budget))[0]
+            .content
+            .clone()
+    }
+
     fn image_count(blocks: &[ContentBlock]) -> usize {
         blocks
             .iter()
@@ -1414,6 +1449,66 @@ mod tests {
             "the oldest images are the ones that make way"
         );
         assert!(matches!(&blocks[EXTRA], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn adapt_images_evicts_the_oldest_past_the_byte_budget() {
+        let model = clamp_test_model(anthropic_spec());
+        let data = crate::image::png_base64(32, 32);
+        let block = || ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from(data.clone())),
+        };
+        // Room for exactly two payloads.
+        let blocks = adapt_within(&model, vec![block(), block(), block()], data.len() * 2);
+        assert_eq!(image_count(&blocks), 2);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text == IMAGE_BUDGET_NOTE),
+            "the oldest image is the one that makes way"
+        );
+        assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
+    }
+
+    /// An image over the remaining budget is skipped, not a wall: older,
+    /// smaller ones may still fit.
+    #[test]
+    fn adapt_images_carries_on_past_one_the_budget_cannot_fit() {
+        let model = clamp_test_model(anthropic_spec());
+        let small = crate::image::png_base64(32, 32);
+        let big = crate::image::png_base64(256, 256);
+        assert!(big.len() > small.len(), "test premise: sizes differ");
+        let block = |data: &String| ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from(data.clone())),
+        };
+        // One byte short of fitting the big one after a small one.
+        let budget = small.len() + big.len() - 1;
+        let blocks = adapt_within(
+            &model,
+            vec![block(&small), block(&big), block(&small)],
+            budget,
+        );
+        assert_eq!(image_count(&blocks), 2);
+        assert!(
+            matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_BUDGET_NOTE),
+            "only the image over the remaining budget makes way"
+        );
+    }
+
+    /// The model carries the budget: provider construction refines it from
+    /// config, and adaptation answers to what the model says.
+    #[test]
+    fn adapt_images_answers_to_the_models_byte_budget() {
+        let mut model = clamp_test_model(anthropic_spec());
+        let data = crate::image::png_base64(32, 32);
+        model.max_image_bytes = data.len() * 2;
+        let block = || ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from(data.clone())),
+        };
+        let blocks = adapt(&model, vec![block(), block(), block()]);
+        assert_eq!(image_count(&blocks), 2);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text == IMAGE_BUDGET_NOTE),
+            "the oldest image is the one that makes way"
+        );
     }
 
     /// An image no provider could read frees no room, so the cap is spent on
@@ -1835,6 +1930,7 @@ mod tests {
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
             context_window: 200_000,
+            max_image_bytes: maki_config::DEFAULT_MAX_REQUEST_IMAGE_BYTES,
             thinking_fields: None,
         }
     }

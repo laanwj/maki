@@ -415,6 +415,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         max_output_tokens: Some(8192),
         turn_output_tokens: None,
         context_window: TEST_CONTEXT_WINDOW,
+        max_image_bytes: maki_config::DEFAULT_MAX_REQUEST_IMAGE_BYTES,
         thinking_fields: None,
     }
 }

@@ -68,6 +68,8 @@ pub struct Timeouts {
     pub stream: Duration,
     pub low_speed: Duration,
     pub retry: RetryPolicy,
+    /// Cap on the total base64 image bytes one request may carry.
+    pub max_image_bytes: usize,
 }
 
 impl Default for Timeouts {
@@ -77,6 +79,7 @@ impl Default for Timeouts {
             stream: Duration::from_secs(300),
             low_speed: Duration::from_secs(30),
             retry: RetryPolicy::default(),
+            max_image_bytes: maki_config::DEFAULT_MAX_REQUEST_IMAGE_BYTES,
         }
     }
 }
@@ -88,6 +91,7 @@ impl From<&maki_config::ProviderConfig> for Timeouts {
             stream: config.stream_timeout,
             low_speed: config.low_speed_timeout,
             retry: config.into(),
+            max_image_bytes: config.max_request_image_bytes,
         }
     }
 }

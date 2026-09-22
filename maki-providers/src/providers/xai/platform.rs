@@ -315,6 +315,7 @@ mod tests {
             max_output_tokens: Some(131_072),
             turn_output_tokens: None,
             context_window: 500_000,
+            max_image_bytes: maki_config::DEFAULT_MAX_REQUEST_IMAGE_BYTES,
             thinking_fields: None,
         }
     }

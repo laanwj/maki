@@ -60,6 +60,11 @@ pub const DEFAULT_MAX_TIMEOUT_RETRIES: u32 = 10;
 /// a spend cap reads, and that one does not clear for the rest of the billing
 /// period.
 pub const DEFAULT_MAX_RETRIES: u32 = 5;
+/// Anthropic refuses a request over 32MB, and image base64 is the bulk of a
+/// heavy one; the transcript's share lives in the gap between this and the
+/// server's number. A proxy with a smaller limit cuts the connection instead
+/// of answering, which reads as a transport error rather than a refusal.
+pub const DEFAULT_MAX_REQUEST_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
@@ -788,6 +793,7 @@ pub struct ProviderFileConfig {
     pub retry_max_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_timeout_retries: Option<u32>,
+    pub max_request_image_bytes: Option<usize>,
 }
 
 impl ProviderFileConfig {
@@ -804,7 +810,8 @@ impl ProviderFileConfig {
             retry_base_ms,
             retry_max_ms,
             max_retries,
-            max_timeout_retries
+            max_timeout_retries,
+            max_request_image_bytes
         );
     }
 }
@@ -1495,6 +1502,10 @@ pub struct ProviderConfig {
     #[config(key = "max_timeout_retries", ty = "u32", default = DEFAULT_MAX_TIMEOUT_RETRIES,
              desc = "Max retries on stream timeouts")]
     pub max_timeout_retries: u32,
+
+    #[config(key = "max_request_image_bytes", ty = "usize", default = DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+             desc = "Max total base64 image bytes per request; the oldest images are omitted past this, 0 omits all images")]
+    pub max_request_image_bytes: usize,
 }
 
 impl Default for ProviderConfig {
@@ -1511,6 +1522,7 @@ impl Default for ProviderConfig {
             retry_max_ms: DEFAULT_RETRY_MAX_MS,
             max_retries: DEFAULT_MAX_RETRIES,
             max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
+            max_request_image_bytes: DEFAULT_MAX_REQUEST_IMAGE_BYTES,
         }
     }
 }
@@ -1540,6 +1552,9 @@ impl ProviderConfig {
             retry_max_ms: f.retry_max_ms.unwrap_or(DEFAULT_RETRY_MAX_MS),
             max_retries: f.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             max_timeout_retries: f.max_timeout_retries.unwrap_or(DEFAULT_MAX_TIMEOUT_RETRIES),
+            max_request_image_bytes: f
+                .max_request_image_bytes
+                .unwrap_or(DEFAULT_MAX_REQUEST_IMAGE_BYTES),
         })
     }
 }
@@ -2940,6 +2955,31 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider.max_retries, 3);
         assert_eq!(config.provider.retry_base_ms, 50);
+    }
+
+    #[test]
+    fn the_image_budget_reads_what_the_file_asked_for() {
+        const BUDGET: usize = 4 * 1024 * 1024;
+        let config = RawConfig {
+            provider: ProviderFileConfig {
+                max_request_image_bytes: Some(BUDGET),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(&[])
+        .unwrap();
+        assert_eq!(config.provider.max_request_image_bytes, BUDGET);
+
+        let defaulted = RawConfig::default().into_config(&[]).unwrap().provider;
+        assert_eq!(
+            defaulted.max_request_image_bytes,
+            DEFAULT_MAX_REQUEST_IMAGE_BYTES
+        );
+        assert_eq!(
+            defaulted.max_request_image_bytes,
+            ProviderConfig::default().max_request_image_bytes
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 
 use jiff::Timestamp;
-use maki_config::ModelPolicy;
+use maki_config::{DEFAULT_MAX_REQUEST_IMAGE_BYTES, ModelPolicy};
 use maki_storage::sessions::{Effort, MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -312,6 +312,7 @@ impl ModelEntry {
             max_output_tokens: self.max_output_tokens.or(base.fallback_max_output),
             turn_output_tokens: None,
             context_window: self.context_window.unwrap_or(base.fallback_context_window),
+            max_image_bytes: DEFAULT_MAX_REQUEST_IMAGE_BYTES,
             thinking_fields: self.thinking_fields.clone().map(Box::new),
         }
     }
@@ -542,6 +543,10 @@ pub struct Model {
     /// turn budget. `None` leaves the declared cap standing.
     pub turn_output_tokens: Option<u32>,
     pub context_window: u32,
+    /// Cap on the total base64 image bytes a request to this model may carry.
+    /// Starts at the global ceiling; provider construction refines it from
+    /// config, the same way `adjust_model` refines the other limits.
+    pub max_image_bytes: usize,
     pub thinking_fields: Option<Box<ThinkingFields>>,
 }
 
@@ -591,6 +596,7 @@ impl Model {
             max_output_tokens,
             turn_output_tokens: None,
             context_window,
+            max_image_bytes: DEFAULT_MAX_REQUEST_IMAGE_BYTES,
             thinking_fields,
         }
     }
@@ -617,6 +623,7 @@ impl Model {
             max_output_tokens: Some(max_output_tokens),
             turn_output_tokens: None,
             context_window,
+            max_image_bytes: DEFAULT_MAX_REQUEST_IMAGE_BYTES,
             thinking_fields: None,
         }
     }
@@ -1849,6 +1856,7 @@ mod tests {
             max_output_tokens,
             turn_output_tokens: None,
             context_window: 200_000,
+            max_image_bytes: DEFAULT_MAX_REQUEST_IMAGE_BYTES,
             thinking_fields: None,
         }
     }

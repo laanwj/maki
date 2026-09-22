@@ -317,7 +317,7 @@ pub(crate) async fn stream_with_retry(
                 // in silence would leave that text for the next attempt to be
                 // appended to.
                 let delay_ms = delay.as_millis() as u64;
-                warn!(attempt, delay_ms, rotated, error = %e, "retryable, will retry");
+                warn!(attempt, delay_ms, rotated, error = %e.chain(), "retryable, will retry");
                 event_tx.send(AgentEvent::Retry {
                     attempt,
                     message,

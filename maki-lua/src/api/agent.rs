@@ -20,7 +20,7 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
     EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
-    RunLedger, SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
+    RunLedger, SessionEvents, SubagentInfo, SubagentMailbox, ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -604,6 +604,7 @@ async fn session(
     // inside its sandbox.
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
 
+    let mailbox = SubagentMailbox::register(Arc::from(ui_id.as_str()));
     let state = SessionState {
         params: AgentParams {
             provider,
@@ -652,13 +653,27 @@ async fn session(
         name,
         usage: TokenUsage::default(),
         usage_rx,
+        mailbox: Some(mailbox),
         start: Instant::now(),
         closed: false,
     };
 
+    let watcher_cancel = state.child_cancel.clone();
+    let inner = Arc::new(AsyncMutex::new(state));
     let sess = lua.create_userdata(LuaSession {
-        inner: Arc::new(AsyncMutex::new(state)),
+        inner: Arc::clone(&inner),
     })?;
+
+    // Close from the cancel token too: a follow-up loop parked in
+    // `next_followup` is abandoned wholesale when its Lua task is cancelled
+    // (esc, reload), so its tail never runs. Without this the mailbox stays
+    // registered until GC and follow-ups vanish into a dead session.
+    smol::spawn(async move {
+        watcher_cancel.cancelled().await;
+        inner.lock().await.close();
+    })
+    .detach();
+
     Ok((Some(sess), None))
 }
 
@@ -784,6 +799,10 @@ struct SessionState {
     name: String,
     usage: TokenUsage,
     usage_rx: flume::Receiver<TokenUsage>,
+    /// User follow-ups addressed to this subagent from the UI. Taken on
+    /// close, which deregisters the id so late messages error instead of
+    /// being queued for nobody, and disconnects any waiting `next_followup`.
+    mailbox: Option<SubagentMailbox>,
     start: Instant,
     closed: bool,
 }
@@ -794,6 +813,7 @@ impl SessionState {
             return;
         }
         self.closed = true;
+        self.mailbox.take();
         self.stream_guard.take();
         self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
@@ -990,6 +1010,44 @@ async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> 
     Ok(())
 }
 
+/// Wait for a follow-up message the user sent to this subagent from its task
+/// chat. Returns nil when the session is closed or cancelled, or when
+/// `timeout_ms` passes with no message.
+///
+/// @param timeout_ms integer? Max wait in milliseconds; waits forever without it.
+/// @return (string|nil) The follow-up text, nil when the wait ends without one.
+#[lua_fn]
+async fn next_followup(
+    _lua: Lua,
+    this: mlua::UserDataRef<LuaSession>,
+    timeout_ms: Option<u64>,
+) -> LuaResult<Option<String>> {
+    let inner = Arc::clone(&this.inner);
+    drop(this);
+    let (rx, cancel) = {
+        let s = inner.lock().await;
+        let Some(mailbox) = &s.mailbox else {
+            return Ok(None);
+        };
+        (mailbox.receiver(), s.child_cancel.clone())
+    };
+    let waiting = async {
+        match timeout_ms {
+            Some(ms) => {
+                futures_lite::future::race(async { rx.recv_async().await.ok() }, async {
+                    smol::Timer::after(Duration::from_millis(ms)).await;
+                    None
+                })
+                .await
+            }
+            None => rx.recv_async().await.ok(),
+        }
+    };
+    // A cancelled subagent stops waiting even mid-timeout: the token firing
+    // is the only signal a run-end or esc cancel has.
+    Ok(cancel.race(waiting).await.ok().flatten())
+}
+
 lua_class! {
     /// A subagent session with its own conversation history.
     ///
@@ -1000,7 +1058,7 @@ lua_class! {
     /// Always call `:close()` when you are done, on error paths too. The
     /// garbage collector is a fallback that may never run while the VM sits
     /// idle, so a session you only drop can stay open for the rest of the run.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close, next_followup]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.

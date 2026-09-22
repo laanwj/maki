@@ -66,6 +66,9 @@ pub struct Chat {
     pub opts: Option<RequestOptions>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
+    /// The input-box text typed while this chat was focused, stashed on switch
+    /// so a follow-up drafted for a subagent cannot leak into another chat.
+    pub(crate) draft: String,
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
@@ -93,6 +96,7 @@ impl Chat {
             opts: None,
             pending_turn_usage: None,
             messages_panel,
+            draft: String::new(),
             finish: None,
         }
     }

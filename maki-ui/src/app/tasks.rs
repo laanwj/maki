@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::app::App;
 use crate::components::DisplayRole;
 
-const UNKNOWN_TASK_ERR: &str = "unknown task: ";
+pub(crate) const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
 /// only sees the transcript close, and the `ToolDone` carrying `is_error`
@@ -114,7 +114,7 @@ impl App {
     /// are looked up by id, never by position and never through `chat_index`,
     /// a routing cache wiped at the end of every turn.
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
-        self.active_chat = if id == MAIN_TASK_ID {
+        let idx = if id == MAIN_TASK_ID {
             0
         } else {
             self.chats
@@ -122,6 +122,7 @@ impl App {
                 .position(|chat| chat.task_id().is_some_and(|task_id| &**task_id == id))
                 .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))?
         };
+        self.focus_chat(idx);
         Ok(())
     }
 }
@@ -153,11 +154,17 @@ pub(crate) fn diff_task_states<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Msg;
     use crate::app::tests::{
-        RESEARCH_NAME, app_with_subagent_id, cancel_app, close_subagent_transcript, end_turn,
-        error_app, finish_subagent, start_subagent,
+        RESEARCH_NAME, agent_msg_with_run_id, app_with_subagent_id, cancel_app,
+        close_subagent_transcript, end_turn, error_app, finish_subagent, start_subagent,
+        subagent_msg, subagent_msg_with_run_id, tool_start,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
+    use crate::components::DisplayRole;
+    use crate::components::key;
+    use crossterm::event::KeyCode;
+    use maki_agent::{AgentEvent, ImageMediaType, ImageSource};
     use test_case::test_case;
 
     const TASK_ID: &str = "toolu_01";
@@ -392,5 +399,208 @@ mod tests {
             vec![(OTHER_ID.to_owned(), TaskStatus::Working)]
         );
         assert_eq!(previous, vec![(two, TaskStatus::Working)]);
+    }
+
+    const FOLLOWUP: &str = "also check the tests";
+
+    /// A subagent session stays open for follow-ups after its first result, so
+    /// the parent's turn ending must leave its routing and status alone. Once
+    /// the session really closes, the next turn end terminalizes the chat.
+    #[test]
+    fn a_live_subagent_survives_the_turn_end() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        let mailbox = maki_agent::SubagentMailbox::register(Arc::from(TASK_ID));
+
+        end_turn(&mut app);
+
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+        assert!(app.chat_index.contains_key(TASK_ID));
+
+        drop(mailbox);
+        end_turn(&mut app);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+        assert!(!app.chat_index.contains_key(TASK_ID));
+    }
+
+    #[test]
+    fn prompt_subagent_delivers_and_draws_the_message() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        let mailbox = maki_agent::SubagentMailbox::register(Arc::from(TASK_ID));
+
+        app.prompt_subagent(TASK_ID, FOLLOWUP.into()).unwrap();
+
+        assert_eq!(smol::block_on(mailbox.recv()).as_deref(), Some(FOLLOWUP));
+        assert_eq!(app.chats[1].last_message_text(), FOLLOWUP);
+        assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::User));
+    }
+
+    #[test]
+    fn prompt_subagent_errors_when_not_live() {
+        let mut app = app_with_subagent_id(TASK_ID);
+
+        let err = app.prompt_subagent(TASK_ID, FOLLOWUP.into()).unwrap_err();
+
+        assert_eq!(err, format!("subagent is no longer running: {TASK_ID}"));
+        assert_ne!(app.chats[1].last_message_text(), FOLLOWUP);
+    }
+
+    #[test]
+    fn prompt_subagent_errors_for_an_unknown_task() {
+        let mut app = app_with_subagent_id(TASK_ID);
+
+        let err = app
+            .prompt_subagent(MISSING_ID, FOLLOWUP.into())
+            .unwrap_err();
+
+        assert_eq!(err, format!("{UNKNOWN_TASK_ERR}{MISSING_ID}"));
+    }
+
+    /// The focused subagent chat owns the input box: typing and submitting
+    /// there must not touch the main chat's queue or start a run.
+    #[test]
+    fn submitting_in_a_subagent_chat_prompts_the_subagent() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        let mailbox = maki_agent::SubagentMailbox::register(Arc::from(TASK_ID));
+        app.focus_task(TASK_ID).unwrap();
+
+        app.update(Msg::Key(key(KeyCode::Char('h'))));
+        app.update(Msg::Key(key(KeyCode::Char('i'))));
+        let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(actions.is_empty(), "no run starts from a subagent chat");
+        assert_eq!(smol::block_on(mailbox.recv()).as_deref(), Some("hi"));
+        assert_eq!(app.chats[1].last_message_text(), "hi");
+        assert!(app.input_box.is_empty());
+        assert!(app.main_chat().last_message_text() != "hi");
+    }
+
+    /// A finished subagent has no live session, so the input box flashes the
+    /// error instead of pretending the follow-up went somewhere.
+    #[test]
+    fn submitting_to_a_finished_subagent_flashes_the_error() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        close_subagent_transcript(&mut app, TASK_ID);
+        app.focus_task(TASK_ID).unwrap();
+
+        app.update(Msg::Key(key(KeyCode::Char('h'))));
+        let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(actions.is_empty());
+        assert_ne!(app.chats[1].last_message_text(), "h");
+        assert_eq!(app.input_box.buffer.value(), "h");
+    }
+
+    /// Ctrl-C with a draft in the box discards the draft, the way the main
+    /// chat does, instead of quitting the app from under the user.
+    #[test]
+    fn ctrl_c_in_a_subagent_chat_discards_the_draft() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        let _mailbox = maki_agent::SubagentMailbox::register(Arc::from(TASK_ID));
+        app.focus_task(TASK_ID).unwrap();
+        app.update(Msg::Key(key(KeyCode::Char('h'))));
+
+        let actions = app.update(Msg::Key(
+            crate::components::keybindings::key::QUIT.to_key_event(),
+        ));
+
+        assert!(actions.is_empty());
+        assert!(app.input_box.is_empty());
+        assert_eq!(app.exit_request, crate::components::ExitRequest::None);
+    }
+
+    /// Events of a conversational subagent keep the run id they were born
+    /// with; a new main run must not make them invisible.
+    #[test]
+    fn subagent_events_land_despite_a_stale_run_id() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        let _mailbox = maki_agent::SubagentMailbox::register(Arc::from(TASK_ID));
+        end_turn(&mut app);
+        app.run_id += 1;
+
+        app.update(subagent_msg_with_run_id(
+            AgentEvent::TextDelta { text: "y".into() },
+            TASK_ID,
+            None,
+            1,
+        ));
+
+        app.chats[1].flush();
+        assert_eq!(app.chats[1].last_message_text(), "xy");
+    }
+
+    /// A main-chat event from a stale run is still dropped: only subagent
+    /// traffic self-routes past the run id guard.
+    #[test]
+    fn main_chat_events_still_drop_on_a_stale_run_id() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        end_turn(&mut app);
+        app.run_id += 1;
+
+        app.update(agent_msg_with_run_id(
+            AgentEvent::TextDelta {
+                text: "stale".into(),
+            },
+            1,
+        ));
+
+        assert_ne!(app.chats[0].last_message_text(), "stale");
+    }
+
+    /// The draft is per chat: a half-typed follow-up must not leak into the
+    /// main chat's input box, and the main chat's draft survives the trip.
+    #[test]
+    fn switching_chats_swaps_input_drafts() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        app.update(Msg::Key(key(KeyCode::Char('m'))));
+
+        app.focus_task(TASK_ID).unwrap();
+        assert!(app.input_box.is_empty(), "main draft must not follow");
+
+        app.update(Msg::Key(key(KeyCode::Char('s'))));
+        app.focus_task(MAIN_TASK_ID).unwrap();
+        assert_eq!(app.input_box.buffer.value(), "m");
+
+        app.focus_task(TASK_ID).unwrap();
+        assert_eq!(app.input_box.buffer.value(), "s");
+    }
+
+    /// A follow-up turn mid-flight when the parent's turn ends is not an
+    /// orphan: its in-progress tools keep spinning.
+    #[test]
+    fn turn_end_keeps_in_progress_tools_of_a_live_subagent() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        let _mailbox = maki_agent::SubagentMailbox::register(Arc::from(TASK_ID));
+        app.update(subagent_msg(tool_start("t1", "bash"), TASK_ID, None));
+        assert_eq!(app.chats[1].in_progress_count(), 1);
+
+        end_turn(&mut app);
+
+        assert_eq!(app.chats[1].in_progress_count(), 1);
+
+        // Once the session is gone, the same sweep terminalizes it.
+        drop(_mailbox);
+        end_turn(&mut app);
+        assert_eq!(app.chats[1].in_progress_count(), 0);
+    }
+
+    /// Refusing images must not eat the follow-up: text and image go back
+    /// into the input box so the user can strip the image and resend.
+    #[test]
+    fn submitting_an_image_to_a_subagent_restores_the_draft() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        let mailbox = maki_agent::SubagentMailbox::register(Arc::from(TASK_ID));
+        // Images stay pending in the box across chat switches: attach in the
+        // main chat, then focus the subagent.
+        app.input_box
+            .attach_image(ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA==")));
+        app.focus_task(TASK_ID).unwrap();
+        app.update(Msg::Key(key(KeyCode::Char('h'))));
+
+        let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(actions.is_empty(), "no run starts from a subagent chat");
+        assert!(mailbox.receiver().try_recv().is_err(), "nothing was sent");
+        assert_eq!(app.input_box.buffer.value(), "h");
+        assert!(!app.input_box.is_empty(), "the image is restored too");
     }
 }

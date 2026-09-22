@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
-use crate::app::tasks::TaskOutcome;
+use crate::app::tasks::{TaskOutcome, UNKNOWN_TASK_ERR};
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
@@ -117,6 +117,7 @@ const PLAN_FORM_ANSWER_WAIT: Duration =
 /// still beats it.
 const PLAN_ACTION_ANSWER_WAIT: Duration =
     Duration::from_secs(PLAN_ROW_HANDLER_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
+const SUBAGENT_NO_IMAGES_MSG: &str = "Subagent follow-ups are text-only";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -884,14 +885,14 @@ impl App {
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
-            return Some(if !self.is_main_chat() || self.input_box.is_empty() {
-                if self.status == Status::Streaming {
-                    return Some(self.handle_cancel());
-                }
-                self.quit()
-            } else {
+            return Some(if !self.input_box.is_empty() {
+                // A typed draft dies before anything bigger, in any chat.
                 self.input_box.discard();
                 vec![]
+            } else if self.status == Status::Streaming {
+                return Some(self.handle_cancel());
+            } else {
+                self.quit()
             });
         }
         if key::HELP.matches(key) {
@@ -1162,9 +1163,13 @@ impl App {
             BuiltinAction::PopQueue => {
                 self.queue.remove(0);
             }
-            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::PrevChat => {
+                let idx = self.active_chat.saturating_sub(1);
+                self.focus_chat(idx);
+            }
             BuiltinAction::NextChat => {
-                self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+                let idx = (self.active_chat + 1).min(self.chats.len() - 1);
+                self.focus_chat(idx);
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
@@ -1227,6 +1232,9 @@ impl App {
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                // Esc is matched before the input box sees the key, so it
+                // keeps meaning "cancel the subagent" even with a half-typed
+                // follow-up sitting in the box.
                 KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
                     if let Some(t) = self.last_esc.take()
                         && t.elapsed() < self.status_bar.flash_duration
@@ -1238,7 +1246,10 @@ impl App {
                         vec![]
                     }
                 }
-                _ => vec![],
+                _ => match self.input_box.handle_key(key) {
+                    InputAction::Submit(sub) => self.handle_submit(sub),
+                    _ => vec![],
+                },
             };
         }
 
@@ -1402,6 +1413,38 @@ impl App {
         if sub.is_empty() {
             return vec![];
         }
+        if !self.is_main_chat() {
+            // A focused subagent chat takes plain text only: no `exit`, no
+            // shell prefix, no slash commands. The follow-up lands in the
+            // subagent's mailbox and its answer streams back into this chat.
+            if !sub.images.is_empty() {
+                self.flash(SUBAGENT_NO_IMAGES_MSG.into());
+                // Refused, not delivered: hand the submission back like the
+                // send failure below does. Images stay pending in the box
+                // across chat switches, so this is reachable with a draft
+                // typed on top of a main-chat attachment.
+                self.input_box.set_input(sub.text);
+                for image in sub.images {
+                    self.input_box.attach_image(image);
+                }
+                self.input_box.buffer.move_to_end();
+                return vec![];
+            }
+            let Some(id) = self.chats[self.active_chat]
+                .task_id()
+                .map(|id| id.to_string())
+            else {
+                return vec![];
+            };
+            if let Err(err) = self.prompt_subagent(&id, sub.text.clone()) {
+                // The message went nowhere, so hand the text back to the
+                // input box instead of dropping it.
+                self.input_box.set_input(sub.text);
+                self.input_box.buffer.move_to_end();
+                self.flash(err);
+            }
+            return vec![];
+        }
         if sub.text.trim() == "exit" {
             return self.quit();
         }
@@ -1422,6 +1465,36 @@ impl App {
             }];
         }
         self.submit_or_queue(sub.into())
+    }
+
+    /// The one place a chat switch happens: stashes the outgoing chat's input
+    /// draft, restores the incoming one's, and closes the palette, which only
+    /// the main chat can drive.
+    pub(crate) fn focus_chat(&mut self, idx: usize) {
+        if idx == self.active_chat {
+            return;
+        }
+        let draft = self.input_box.buffer.value();
+        self.chats[self.active_chat].draft = draft;
+        self.active_chat = idx;
+        let draft = std::mem::take(&mut self.chats[idx].draft);
+        self.input_box.set_input(draft);
+        self.input_box.buffer.move_to_end();
+        self.command_palette.close();
+    }
+
+    /// Hands the user's follow-up to a live subagent and draws it in its chat.
+    /// A finished subagent has no mailbox, so this errors instead of
+    /// pretending the message went somewhere.
+    pub(crate) fn prompt_subagent(&mut self, id: &str, text: String) -> Result<(), String> {
+        let chat_idx = self
+            .chats
+            .iter()
+            .position(|chat| chat.task_id().is_some_and(|task_id| &**task_id == id))
+            .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))?;
+        maki_agent::SubagentMailbox::send(id, text.clone()).map_err(|e| e.to_string())?;
+        self.chats[chat_idx].show_user_message(text, Vec::new());
+        Ok(())
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -1492,19 +1565,27 @@ impl App {
             return vec![];
         }
         if envelope.run_id != self.run_id {
-            // A snapshot dropped here degrades the tool body to llm_output.
-            if let AgentEvent::ToolSnapshot { id, .. }
-            | AgentEvent::ToolHeaderSnapshot { id, .. }
-            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
+            // A conversational subagent outlives the run that spawned it, so
+            // its events keep the creation run's id. They self-route through
+            // `subagent` (or the tool_use_id on SubagentHistory), unlike main
+            // chat events, which a stale run must not be able to draw.
+            if envelope.subagent.is_none()
+                && !matches!(envelope.event, AgentEvent::SubagentHistory { .. })
             {
-                tracing::debug!(
-                    tool_id = %id,
-                    event_run_id = envelope.run_id,
-                    current_run_id = self.run_id,
-                    "tool render event dropped: stale run_id"
-                );
+                // A snapshot dropped here degrades the tool body to llm_output.
+                if let AgentEvent::ToolSnapshot { id, .. }
+                | AgentEvent::ToolHeaderSnapshot { id, .. }
+                | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
+                {
+                    tracing::debug!(
+                        tool_id = %id,
+                        event_run_id = envelope.run_id,
+                        current_run_id = self.run_id,
+                        "tool render event dropped: stale run_id"
+                    );
+                }
+                return vec![];
             }
-            return vec![];
         }
 
         if let AgentEvent::SubagentHistory {
@@ -1667,8 +1748,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_answers.clear();
+                    self.drop_finished_routing();
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -1681,11 +1761,10 @@ impl App {
                         DisplayRole::Error,
                         cap_error_text(&message),
                     ));
-                    self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.chat_index.clear();
+                    self.drop_finished_routing();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -2305,26 +2384,38 @@ impl App {
     }
 
     fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
-        self.retain_resolved_subagents(outcome, text);
+        self.retain_resolved_subagents(outcome, text, false);
         self.chat_index.clear();
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
     /// shell commands that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
-        self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
+        self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT, true);
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1) {
-            chat.fail_in_progress_with_message(message.into());
+            // A live conversational session may be mid-follow-up right now;
+            // its in-progress tools are not orphans of the ended run.
+            let live = chat
+                .task_id()
+                .is_some_and(|id| maki_agent::SubagentMailbox::is_live(id));
+            if !live {
+                chat.fail_in_progress_with_message(message.into());
+            }
         }
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
     /// `chat_index`, so the session records only the children that really
-    /// completed.
-    fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
-        self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
+    /// completed. On a plain turn end (`keep_live`) a subagent whose session
+    /// is still alive for follow-ups is left alone: it is not finished, and
+    /// its routing must stay. On cancel nothing is kept: the run token dying
+    /// is what closes those sessions, and their chats end here.
+    fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str, keep_live: bool) {
+        self.chat_index.retain(|id, &mut sub_idx| {
+            if self.chats[sub_idx].is_finished()
+                || (keep_live && maki_agent::SubagentMailbox::is_live(id))
+            {
                 true
             } else {
                 self.chats[sub_idx].mark_finished(outcome, text);
@@ -2332,6 +2423,16 @@ impl App {
             }
         });
         self.sync_subagents();
+    }
+
+    /// Turn end clears the routing caches keyed by tool_use_id, except for
+    /// subagent sessions still alive for follow-ups: their events, permission
+    /// prompts and auth retries keep landing in their chat.
+    fn drop_finished_routing(&mut self) {
+        self.chat_index
+            .retain(|id, _| maki_agent::SubagentMailbox::is_live(id));
+        self.subagent_answers
+            .retain(|id, _| maki_agent::SubagentMailbox::is_live(id));
     }
 
     pub fn flush_all_chats(&mut self) {
@@ -2368,11 +2469,12 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
-        if !self.is_main_chat() {
-            return;
-        }
         if let InputAction::Changed = self.input_box.handle_paste(text) {
-            self.input_changed(InputWriter::Anyone);
+            // The palette answers slash commands; a subagent chat sends plain
+            // text, so there is nothing to sync it with there.
+            if self.is_main_chat() {
+                self.input_changed(InputWriter::Anyone);
+            }
         }
     }
 

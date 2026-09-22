@@ -1376,6 +1376,10 @@ impl<'t> EventLoop<'t> {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+            TaskRequest::Prompt { id, text } => self
+                .focused_app()
+                .prompt_subagent(&id, text)
+                .map(|()| json!(true)),
         }
     }
 

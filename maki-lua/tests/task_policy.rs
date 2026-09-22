@@ -48,11 +48,15 @@ const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 const SCENARIO_NO_SUMMARY: &str = "no_summary";
 const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
+const SCENARIO_FOLLOWUP: &str = "followup";
+
+const FOLLOWUP_TEXT: &str = "also check the tests";
+const FIRST_TEXT: &str = "initial result";
 
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
 const STUB_PRELUDE: &str = r#"
-recorder = { prompts = {}, closed = 0, sessions = 0, acquired = 0, released = 0 }
+recorder = { prompts = {}, closed = 0, sessions = 0, acquired = 0, released = 0, followups = {} }
 
 -- Spy wrapper: the real semaphore does the work, counters track that every
 -- permit is explicitly released (gc would silently hide a leak).
@@ -139,6 +143,16 @@ behaviors.raise = function(sess, msg)
   error("@RAISE_MSG@")
 end
 
+-- Queues one follow-up from inside the initial prompt, so it is there before
+-- the handler returns and the background loop's first next_followup reads it.
+behaviors.followup = function(sess, msg)
+  if #recorder.prompts == 1 then
+    recorder.followups[#recorder.followups + 1] = "@FOLLOWUP_TEXT@"
+    return { text = "@FIRST_TEXT@" }
+  end
+  return { text = "followup done" }
+end
+
 maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
@@ -147,6 +161,12 @@ maki.agent.session = function(ctx, opts)
   function sess:prompt(msg)
     recorder.prompts[#recorder.prompts + 1] = msg
     return behaviors[opts.name](self, msg)
+  end
+  function sess:next_followup(timeout_ms)
+    if #recorder.followups > 0 then
+      return table.remove(recorder.followups, 1)
+    end
+    return nil
   end
   function sess:close()
     recorder.closed = recorder.closed + 1
@@ -198,6 +218,8 @@ fn load_task_host_with_opts(
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
+        .replace("@FOLLOWUP_TEXT@", FOLLOWUP_TEXT)
+        .replace("@FIRST_TEXT@", FIRST_TEXT)
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
         .replace("@CANCELLED_ERR@", CANCELLED_ERR);
@@ -227,6 +249,22 @@ fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, Str
 fn probe(reg: &ToolRegistry) -> Value {
     let out = exec_tool(reg, PROBE_TOOL, json!({})).expect("probe failed");
     serde_json::from_str(&out).expect("probe returned invalid json")
+}
+
+/// The follow-up loop runs as a background task on the Lua runtime, so the
+/// session closes a beat after the tool call returns. Poll the probe until
+/// the runtime got there; every probe request yields the runtime loop once,
+/// which is what lets the spawned task run, so this converges immediately.
+fn probe_until(reg: &ToolRegistry, pred: impl Fn(&Value) -> bool) -> Value {
+    const POLL_ATTEMPTS: usize = 100;
+    for _ in 0..POLL_ATTEMPTS {
+        let snap = probe(reg);
+        if pred(&snap) {
+            return snap;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("probe condition not met after {POLL_ATTEMPTS} attempts");
 }
 
 fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
@@ -352,9 +390,8 @@ fn structured_happy_path_returns_validated_json() {
     let parsed: Value = serde_json::from_str(&out).expect("result is not json");
     assert_eq!(parsed, json!({ "answer": "42" }));
 
-    let snap = probe(&reg);
+    let snap = probe_until(&reg, |s| s["closed"] == json!(1));
     assert_eq!(snap["sessions"], json!(1));
-    assert_eq!(snap["closed"], json!(1));
     assert_eq!(snap["prompt_count"], json!(1));
     assert_eq!(snap["has_local_tools"], json!(true));
     assert!(snap["first_ack"].is_string(), "valid input must be acked");
@@ -379,7 +416,7 @@ fn invalid_then_valid_recovers_within_one_prompt() {
     let parsed: Value = serde_json::from_str(&out).expect("result is not json");
     assert_eq!(parsed, json!({ "answer": "42" }));
 
-    let snap = probe(&reg);
+    let snap = probe_until(&reg, |s| s["closed"] == json!(1));
     assert!(snap.get("first_ack").is_none_or(Value::is_null));
     let first_err = snap["first_err"].as_str().expect("first_err missing");
     assert!(
@@ -389,7 +426,17 @@ fn invalid_then_valid_recovers_within_one_prompt() {
     assert!(snap["second_ack"].is_string(), "valid retry must be acked");
     assert!(snap.get("second_err").is_none_or(Value::is_null));
     assert_eq!(snap["prompt_count"], json!(1));
-    assert_eq!(snap["closed"], json!(1));
+}
+
+#[test]
+fn followup_runs_an_extra_turn_and_closes() {
+    let (reg, _host) = load_task_host();
+    let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_FOLLOWUP, None)).unwrap();
+    assert_eq!(out, FIRST_TEXT);
+
+    let snap = probe_until(&reg, |s| s["closed"] == json!(1));
+    assert_eq!(snap["prompt_count"], json!(2));
+    assert_eq!(snap["prompts"][1], json!(FOLLOWUP_TEXT));
 }
 
 #[test]
@@ -403,13 +450,12 @@ fn missing_structured_output_nudges_then_errors() {
     .unwrap_err();
     assert_eq!(err, STRUCTURED_MISSING_ERROR);
 
-    let snap = probe(&reg);
+    let snap = probe_until(&reg, |s| s["closed"] == json!(1));
     assert_eq!(snap["prompt_count"], json!(1 + MAX_STRUCTURED_RETRIES));
     for i in 1..=MAX_STRUCTURED_RETRIES {
         let nudge = snap["prompts"][i].as_str().expect("nudge prompt missing");
         assert!(nudge.contains(STRUCTURED_OUTPUT_TOOL), "got: {nudge}");
     }
-    assert_eq!(snap["closed"], json!(1));
 }
 
 #[test]
@@ -439,8 +485,7 @@ fn prompt_error_maps_to_sub_agent_error() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
     assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
-    let snap = probe(&reg);
-    assert_eq!(snap["closed"], json!(1));
+    probe_until(&reg, |s| s["closed"] == json!(1));
 }
 
 /// Esc during a sub-agent run: the prompt hands back both an error and
@@ -462,11 +507,10 @@ fn plain_path_returns_text_without_local_tools() {
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
 
-    let snap = probe(&reg);
+    let snap = probe_until(&reg, |s| s["closed"] == json!(1));
     assert_eq!(snap["has_local_tools"], json!(false));
     assert_eq!(snap["prompt_count"], json!(1));
     assert_eq!(snap["prompts"][0], json!(TASK_PROMPT));
-    assert_eq!(snap["closed"], json!(1));
 }
 
 #[test]
@@ -480,11 +524,10 @@ fn no_summary_nudges_then_recovers() {
     .unwrap();
     assert_eq!(out, RECOVERED_TEXT);
 
-    let snap = probe(&reg);
+    let snap = probe_until(&reg, |s| s["closed"] == json!(1));
     assert_eq!(snap["prompt_count"], json!(2));
     let nudge = snap["prompts"][1].as_str().expect("nudge prompt missing");
     assert!(nudge.contains(SUMMARY_NUDGE_FRAGMENT), "got: {nudge}");
-    assert_eq!(snap["closed"], json!(1));
 }
 
 #[test]
@@ -493,9 +536,8 @@ fn no_summary_errors_after_nudges() {
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_NO_SUMMARY, None)).unwrap_err();
     assert_eq!(err, SUMMARY_MISSING_ERROR);
 
-    let snap = probe(&reg);
+    let snap = probe_until(&reg, |s| s["closed"] == json!(1));
     assert_eq!(snap["prompt_count"], json!(1 + MAX_STRUCTURED_RETRIES));
-    assert_eq!(snap["closed"], json!(1));
 }
 
 /// Spy counters catch a leaked permit even when gc would silently reclaim it.

@@ -316,6 +316,7 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
+| `followup_idle_secs` | integer | `120` | 1 | How long a finished subagent stays reachable for follow-up messages from its task chat before its session closes. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
 
 ### `plugins.webfetch`

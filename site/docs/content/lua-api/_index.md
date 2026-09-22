@@ -1512,6 +1512,24 @@ Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
 
+---
+
+### `Session:next_followup()` {#Session-next_followup}
+
+```lua
+Session:next_followup({timeout_ms?})
+```
+
+Wait for a follow-up message the user sent to this subagent from its task
+chat. Returns nil when the session is closed or cancelled, or when
+`timeout_ms` passes with no message.
+
+**Parameters:**
+
+- `{timeout_ms?}` (`integer?`) Max wait in milliseconds; waits forever without it.
+
+**Returns:** (`string|nil`) The follow-up text, nil when the wait ends without one.
+
 
 ## maki.async {#maki-async}
 
@@ -4442,6 +4460,31 @@ another session returns an error instead of landing on the wrong task.
 
 ```lua
 local _, err = maki.task.focus("main")
+```
+
+---
+
+### `maki.task.prompt()` {#maki-task-prompt}
+
+```lua
+maki.task.prompt({id}, {text})
+```
+
+Sends a follow-up message to a live subagent. The message lands in the
+subagent's chat and the subagent answers it there. A finished or unknown
+task returns an error.
+
+**Parameters:**
+
+- `{id}` (`string`) Task id, as returned by `list()`.
+- `{text}` (`string`) The follow-up message.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local ok, err = maki.task.prompt("toolu_01", "also check the tests")
 ```
 
 

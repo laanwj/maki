@@ -186,6 +186,12 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         self.lock().clear();
     }
 
+    /// [`cancel_all`](Self::cancel_all) that spares ids `keep` accepts. A kept
+    /// entry stays registered and unmarked; a dropped one fires its triggers.
+    pub fn cancel_all_except(&self, keep: impl Fn(&K) -> bool) {
+        self.lock().retain(|id, _| keep(id));
+    }
+
     #[cfg(test)]
     fn has_key(&self, id: &K) -> bool {
         self.lock().contains_key(id)
@@ -345,6 +351,22 @@ mod tests {
         let (trigger, token) = CancelToken::new();
         map.insert(key(), trigger);
         assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_all_except_spares_kept_ids() {
+        let map: CancelMap<String> = CancelMap::new();
+        let (t1, tok1) = CancelToken::new();
+        let (t2, tok2) = CancelToken::new();
+        map.insert(key(), t1);
+        map.insert(OTHER_KEY.to_owned(), t2);
+
+        map.cancel_all_except(|id| id == OTHER_KEY);
+
+        assert!(tok1.is_cancelled());
+        assert!(!tok2.is_cancelled());
+        assert!(!map.has_key(&key()));
+        assert!(map.has_key(&OTHER_KEY.to_owned()));
     }
 
     /// One tool call can open several subagents. They used to evict each

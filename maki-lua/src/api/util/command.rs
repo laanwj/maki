@@ -466,6 +466,7 @@ pub enum SessionRequest {
 pub enum TaskRequest {
     List,
     Focus { id: String },
+    Prompt { id: String, text: String },
 }
 
 pub enum ModelRequest {

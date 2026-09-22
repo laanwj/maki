@@ -53,6 +53,11 @@ local opts = maki.api.register_options({
     default = false,
     desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
   },
+  followup_idle_secs = {
+    default = 120,
+    min = 1,
+    desc = "How long a finished subagent stays reachable for follow-up messages from its task chat before its session closes.",
+  },
 })
 
 local schema = {
@@ -240,7 +245,36 @@ local function handler(input, ctx)
   end)
 
   if sess then
-    sess:close()
+    if ok then
+      -- Keep the session alive past the tool result: the user can send
+      -- follow-ups from the subagent's task chat, and each one runs another
+      -- turn here. The loop ends on idle timeout, on cancel, or when the
+      -- mailbox closes; `close` then flushes the full history to the UI.
+      --
+      -- The gate counts this task, so unloading the plugin waits for it -
+      -- that wait is bounded by followup_idle_secs.
+      maki.async.run(function()
+        while true do
+          local followup = sess:next_followup(opts.followup_idle_secs * 1000)
+          if not followup then
+            break
+          end
+          -- The answer streams into the task chat through the session's own
+          -- event relay; nothing here needs the result. A raise means the
+          -- session is broken, so close instead of looping on it.
+          local prompt_ok, prompt_err = pcall(function()
+            sess:prompt(followup)
+          end)
+          if not prompt_ok then
+            maki.ui.flash(tostring(prompt_err))
+            break
+          end
+        end
+        sess:close()
+      end)
+    else
+      sess:close()
+    end
   end
   permit:release()
   if not ok then

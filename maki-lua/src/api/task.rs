@@ -5,7 +5,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Value};
 
 use crate::api::util::command::{TaskRequest, UiAction, ui_json_roundtrip};
-use crate::api::util::pair::Pair;
+use crate::api::util::pair::{Pair, err_pair};
 
 async fn roundtrip(
     lua: Lua,
@@ -18,6 +18,8 @@ async fn roundtrip(
     })
     .await
 }
+
+const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 
 /// Lists the focused session's chats in chat order. Entry 1 is always the main
 /// chat, with id `"main"` and no `status`: its work is the session's own, and
@@ -51,13 +53,35 @@ async fn focus(
     roundtrip(lua, tx, TaskRequest::Focus { id }).await
 }
 
+/// Sends a follow-up message to a live subagent. The message lands in the
+/// subagent's chat and the subagent answers it there. A finished or unknown
+/// task returns an error.
+///
+/// @param id string Task id, as returned by `list()`.
+/// @param text string The follow-up message.
+/// @return (boolean|nil, string|nil) true on success, or nil and an error.
+/// @example
+/// local ok, err = maki.task.prompt("toolu_01", "also check the tests")
+#[lua_fn]
+async fn prompt(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    id: String,
+    text: String,
+) -> LuaResult<Pair<Value>> {
+    if text.trim().is_empty() {
+        return Ok(err_pair(EMPTY_PROMPT_ERR));
+    }
+    roundtrip(lua, tx, TaskRequest::Prompt { id, text }).await
+}
+
 lua_table! {
     /// The subagents of the focused session and their transcripts. Tasks are
     /// spawned by the `task` tool and addressed by an id that survives a reload.
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.task" => pub(crate) fn create_task_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), focus(tx)]
+    DOCS [list(tx), focus(tx), prompt(tx)]
 }
 
 #[cfg(test)]
@@ -113,8 +137,11 @@ mod tests {
         })
     }
 
+    const PROMPT_CALL: &str = "return task.prompt('toolu_01', 'also check the tests')";
+
     #[test_case(LIST_CALL ; "list")]
     #[test_case(FOCUS_CALL ; "focus")]
+    #[test_case(PROMPT_CALL ; "prompt")]
     fn without_ui_returns_error_pair(code: &str) {
         let lua = lua_with_task(None);
         let (val, err): (Value, Option<String>) =
@@ -127,6 +154,7 @@ mod tests {
     /// as the `(nil, err)` pair, word for word, without raising into the plugin.
     #[test_case(LIST_CALL ; "list")]
     #[test_case(FOCUS_CALL ; "focus")]
+    #[test_case(PROMPT_CALL ; "prompt")]
     fn host_error_reply_surfaces_as_error_pair(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
@@ -191,5 +219,41 @@ mod tests {
         .unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), TASK_ID);
+    }
+
+    #[test]
+    fn prompt_roundtrips_id_and_text_through_ui_channel() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_task(Some(tx));
+        std::thread::spawn(move || {
+            let Ok(UiAction::Task {
+                req: TaskRequest::Prompt { id, text },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected prompt request");
+            };
+            assert_eq!(id, TASK_ID);
+            assert_eq!(text, "also check the tests");
+            reply_tx.send(Ok(json!(true))).unwrap();
+        });
+        let (val, err): (bool, Option<String>) =
+            smol::block_on(lua.load(PROMPT_CALL).eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert!(val);
+    }
+
+    #[test]
+    fn prompt_rejects_blank_text_without_a_roundtrip() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_task(Some(tx));
+        let (val, err): (Value, Option<String>) = smol::block_on(
+            lua.load("return task.prompt('toolu_01', '   ')")
+                .eval_async(),
+        )
+        .unwrap();
+        assert!(val.is_nil());
+        assert_eq!(err.as_deref(), Some(EMPTY_PROMPT_ERR));
+        assert!(rx.try_recv().is_err(), "blank text must not reach the host");
     }
 }

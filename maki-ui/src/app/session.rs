@@ -120,7 +120,13 @@ impl App {
     /// and an empty `Vec` does not allocate.
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
-        let draft = self.input_box.buffer.value();
+        // The draft on disk is the main chat's: while a subagent chat is
+        // focused the input box holds that chat's draft, so read the stash.
+        let draft = if self.active_chat == 0 {
+            self.input_box.buffer.value()
+        } else {
+            self.chats[0].draft.clone()
+        };
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),

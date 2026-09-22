@@ -259,7 +259,7 @@ fn agent_msg(event: AgentEvent) -> Msg {
     agent_msg_with_run_id(event, 1)
 }
 
-fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
+pub(crate) fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
     Msg::Agent(Box::new(Envelope {
         event,
         subagent: None,
@@ -306,11 +306,11 @@ fn subagent_info_with_tx(
     }
 }
 
-fn subagent_msg(event: AgentEvent, parent_id: &str, name: Option<&str>) -> Msg {
+pub(crate) fn subagent_msg(event: AgentEvent, parent_id: &str, name: Option<&str>) -> Msg {
     subagent_msg_with_run_id(event, parent_id, name, 1)
 }
 
-fn subagent_msg_with_run_id(
+pub(crate) fn subagent_msg_with_run_id(
     event: AgentEvent,
     parent_id: &str,
     name: Option<&str>,
@@ -348,7 +348,7 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
     }))
 }
 
-fn tool_start(id: &str, tool: &str) -> AgentEvent {
+pub(crate) fn tool_start(id: &str, tool: &str) -> AgentEvent {
     AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: id.into(),
         tool: tool.into(),

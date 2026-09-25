@@ -167,6 +167,7 @@ impl RawServerConfig {
 pub enum RawTransport {
     Stdio(RawStdioFields),
     Http(RawHttpFields),
+    Socket(RawSocketFields),
 }
 
 #[derive(Deserialize, Clone)]
@@ -186,6 +187,11 @@ pub struct RawHttpFields {
     /// A PEM bundle that replaces the default CAs, for OAuth too, like curl's `--cacert`.
     #[serde(default)]
     pub ca_file: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct RawSocketFields {
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +233,9 @@ pub enum Transport {
         headers: HashMap<String, String>,
         oauth: Option<OauthClientConfig>,
         ca_file: Option<PathBuf>,
+    },
+    Socket {
+        path: PathBuf,
     },
 }
 
@@ -332,6 +341,14 @@ pub fn parse_server(
                 environment: expand_map(&name, "environment", cfg.environment)?,
             }
         }
+        RawTransport::Socket(cfg) => {
+            if cfg.path.as_os_str().is_empty() {
+                return Err(McpError::Config(format!(
+                    "server '{name}' has an empty socket path"
+                )));
+            }
+            Transport::Socket { path: cfg.path }
+        }
         RawTransport::Http(cfg) => {
             if !cfg.url.starts_with("http://") && !cfg.url.starts_with("https://") {
                 return Err(McpError::Config(format!(
@@ -368,6 +385,7 @@ pub fn transport_kind(raw: &RawTransport) -> &'static str {
     match raw {
         RawTransport::Stdio(_) => "stdio",
         RawTransport::Http(_) => "http",
+        RawTransport::Socket(_) => "socket",
     }
 }
 
@@ -531,11 +549,42 @@ mod tests {
         cfg
     }
 
+    fn socket_raw(path: &str) -> RawServerConfig {
+        RawServerConfig {
+            enabled: true,
+            timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
+            transport: RawTransport::Socket(RawSocketFields { path: path.into() }),
+        }
+    }
+
+    #[test]
+    fn parses_socket_server_from_toml() {
+        let config: McpConfig = toml::from_str(
+            r#"
+[mcp.exec]
+path = "/run/maki/exec.sock"
+"#,
+        )
+        .unwrap();
+        let parsed = parse_server(
+            "exec".into(),
+            config.mcp["exec"].clone(),
+            Path::new(CONFIG_PATH),
+        )
+        .unwrap();
+        match parsed.transport {
+            Transport::Socket { path } => assert_eq!(path, PathBuf::from("/run/maki/exec.sock")),
+            other => panic!("expected socket transport, got {other:?}"),
+        }
+    }
+
     #[test_case("srv",       stdio_raw(&[]),            "empty command"        ; "empty_command")]
     #[test_case("bash",      stdio_raw(&["echo"]),      "conflicts with built-in" ; "builtin_name_collision")]
     #[test_case("bad name!", stdio_raw(&["echo"]),      "ASCII alphanumeric"   ; "invalid_server_name")]
     #[test_case("srv",       http_raw("ftp://bad.com"), "http://"              ; "invalid_http_url")]
     #[test_case("srv",       http_raw_with_ca("${MAKI_TEST_MCP_UNSET_84421}/ca.pem"), "MAKI_TEST_MCP_UNSET_84421" ; "ca_file_unset_var")]
+    #[test_case("srv",       socket_raw(""),            "empty socket path"    ; "empty_socket_path")]
     fn parse_server_rejects(name: &str, cfg: RawServerConfig, expected_msg: &str) {
         let err = parse(name, cfg).unwrap_err();
         assert!(err.to_string().contains(expected_msg), "got: {err}");

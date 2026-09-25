@@ -2720,6 +2720,7 @@ dependencies = [
  "arc-swap",
  "async-io",
  "async-lock",
+ "async-net",
  "async-process",
  "base64 0.22.1",
  "bitflags 2.13.1",

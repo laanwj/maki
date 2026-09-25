@@ -18,8 +18,10 @@
 pub mod config;
 pub mod error;
 pub mod http;
+pub mod line;
 pub mod oauth;
 pub mod protocol;
+pub mod socket;
 pub mod stdio;
 pub mod transport;
 
@@ -42,6 +44,7 @@ use self::config::{
 };
 use self::error::McpError;
 use self::http::HttpTransport;
+use self::socket::SocketTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::tools::CallOrigin;
@@ -914,6 +917,9 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             maki_storage::StateDir::resolve().ok(),
             ca_file.as_deref(),
         )?),
+        Transport::Socket { path } => {
+            Arc::new(SocketTransport::connect(&config.name, path, config.timeout).await?)
+        }
     };
     let capabilities = transport::initialize(transport.as_ref()).await?;
     // Asymmetric on purpose: sloppy servers omit `capabilities` yet serve

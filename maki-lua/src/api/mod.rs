@@ -10,6 +10,7 @@ pub(crate) mod interpreter;
 pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
+pub(crate) mod mcp;
 pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
@@ -48,6 +49,27 @@ use maki_providers::plugin::DeclAuthority;
 pub(crate) struct Owner {
     pub name: Arc<str>,
     pub authority: DeclAuthority,
+}
+
+fn unavailable_table(lua: &Lua, ns: &str) -> LuaResult<Table> {
+    let message = format!("maki.{ns}: not available in executor-role plugins");
+    let t = lua.create_table()?;
+    let meta = lua.create_table()?;
+    let read_err = message.clone();
+    meta.set(
+        "__index",
+        lua.create_function(move |_, _: mlua::Variadic<Value>| -> LuaResult<()> {
+            Err(mlua::Error::runtime(read_err.clone()))
+        })?,
+    )?;
+    meta.set(
+        "__newindex",
+        lua.create_function(move |_, _: mlua::Variadic<Value>| -> LuaResult<()> {
+            Err(mlua::Error::runtime(message.clone()))
+        })?,
+    )?;
+    t.set_metatable(Some(meta))?;
+    Ok(t)
 }
 
 pub(crate) fn create_maki_global(
@@ -94,6 +116,7 @@ pub(crate) fn create_maki_global(
     maki.set("base64", base64::create_base64_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
+    maki.set("mcp", mcp::create_mcp_table(lua, Arc::clone(&plugin))?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     warn_invalid_net_hosts(&plugin, reach.egress().declared());
     // One egress value shared by the two namespaces that can open a socket, so
@@ -103,10 +126,6 @@ pub(crate) fn create_maki_global(
     maki.set(
         "net",
         net::create_net_table(lua, permissions, egress.clone(), Arc::clone(&plugin))?,
-    )?;
-    maki.set(
-        "plan",
-        plan::create_plan_table(lua, ui_action_tx.clone(), permissions)?,
     )?;
     maki.set(
         "provider",
@@ -128,14 +147,31 @@ pub(crate) fn create_maki_global(
             permissions.is_allowed(Permission::Agent),
         )?,
     )?;
-    maki.set(
-        "model",
-        model::create_model_table(lua, ui_action_tx.clone(), permissions)?,
-    )?;
-    maki.set(
-        "task",
-        task::create_task_table(lua, ui_action_tx.clone(), permissions)?,
-    )?;
+    let role = crate::role::current(lua);
+    if role.is_executor() {
+        for ns in ["keymap", "task", "plan", "model"] {
+            maki.set(ns, unavailable_table(lua, ns)?)?;
+        }
+    } else {
+        maki.set(
+            "plan",
+            plan::create_plan_table(lua, ui_action_tx.clone(), permissions)?,
+        )?;
+        maki.set(
+            "model",
+            model::create_model_table(lua, ui_action_tx.clone(), permissions)?,
+        )?;
+        maki.set(
+            "task",
+            task::create_task_table(lua, ui_action_tx.clone(), permissions)?,
+        )?;
+        maki.set(
+            "keymap",
+            keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
+        )?;
+    }
+    // maki.ui self-gates per function: text utilities and flash work anywhere,
+    // window/input fns answer a loud error in executor-role plugins.
     maki.set(
         "ui",
         ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin), permissions)?,
@@ -165,10 +201,7 @@ pub(crate) fn create_maki_global(
         "agent",
         agent::create_agent_table(lua, Arc::clone(&plugin), permissions.clone())?,
     )?;
-    maki.set(
-        "keymap",
-        keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
-    )?;
+
     pack::add_packadd(lua, &maki)?;
     maki.set("pack", pack::create_pack_read_table(lua)?)?;
 

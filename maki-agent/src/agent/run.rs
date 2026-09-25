@@ -960,6 +960,7 @@ impl<'h> Agent<'h> {
             reauth: self.reauth,
             loaded_instructions: self.loaded_instructions.clone(),
             call_instructions: CallInstructions::default(),
+            attach_instructions: true,
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
             deadline: Deadline::default(),

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, info};
 
 use std::collections::HashMap;
 
@@ -13,6 +13,7 @@ use super::protocol::{
     CallToolResult, GetPromptResult, PromptInfo, PromptsListResult, ResourceContent, ResourceInfo,
     ResourcesListResult, ResourcesReadResult, ToolInfo, ToolsListResult, initialize_params,
 };
+use crate::tools::ToolOutputMode;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -32,6 +33,11 @@ pub trait McpTransport: Send + Sync {
     fn transport_kind(&self) -> &'static str;
     fn child_pids(&self) -> Vec<u32> {
         Vec::new()
+    }
+    /// Line-based transports route server notifications (progress, log
+    /// messages) to watchers; anything else gets nothing.
+    fn notification_hub(&self) -> Option<super::line::NotificationHub> {
+        None
     }
 }
 
@@ -59,12 +65,39 @@ impl ServerCapabilities {
 }
 
 pub async fn initialize(transport: &dyn McpTransport) -> Result<ServerCapabilities, McpError> {
-    let params = initialize_params();
+    initialize_with(transport, None).await
+}
+
+/// `initialize` with extra params merged in — the brain's executor config
+/// push rides the executor's handshake this way.
+pub async fn initialize_with(
+    transport: &dyn McpTransport,
+    extra: Option<Value>,
+) -> Result<ServerCapabilities, McpError> {
+    Ok(ServerCapabilities::parse(
+        &initialize_full(transport, extra).await?,
+    ))
+}
+
+/// The raw initialize result: extras like the executor's workspace report
+/// live outside the capabilities.
+pub async fn initialize_full(
+    transport: &dyn McpTransport,
+    extra: Option<Value>,
+) -> Result<Value, McpError> {
+    let mut params = initialize_params();
+    if let Some(extra) = extra
+        && let (Some(extra), Some(map)) = (extra.as_object(), params.as_object_mut())
+    {
+        for (key, value) in extra {
+            map.insert(key.clone(), value.clone());
+        }
+    }
     let result = transport.send_request("initialize", Some(params)).await?;
     transport
         .send_notification("notifications/initialized", None)
         .await?;
-    Ok(ServerCapabilities::parse(&result))
+    Ok(result)
 }
 
 pub async fn list_tools(transport: &dyn McpTransport) -> Result<Vec<ToolInfo>, McpError> {
@@ -127,11 +160,14 @@ pub async fn read_resource(
     Ok(parsed.contents)
 }
 
-/// The text and optional vision content returned by a tools/call.
+/// What a tools/call returned: the text every tool yields, plus the image
+/// an image tool's answer carries (the model reads it as vision input), plus
+/// the instruction blocks a maki executor found while the tool ran.
 #[derive(Debug)]
 pub struct McpCallOutput {
     pub text: String,
     pub image: Option<maki_providers::ImageSource>,
+    pub instructions: Vec<crate::InstructionBlock>,
 }
 
 /// Fires a transport's best-effort `notifications/cancelled` when a request
@@ -173,12 +209,60 @@ pub async fn call_tool(
     tool_name: &str,
     args: &Value,
 ) -> Result<McpCallOutput, McpError> {
-    let server = &**transport.server_name();
-    let start = Instant::now();
     let params = serde_json::json!({
         "name": tool_name,
         "arguments": args,
     });
+    call_tool_inner(transport, params).await
+}
+
+/// The chat (and subagent task) a tools/call serves; the executor keys
+/// per-session tool state on it. Both `None` for sessionless callers.
+#[derive(Clone, Copy, Debug)]
+pub struct CallRoute<'a> {
+    pub session_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub output_mode: ToolOutputMode,
+}
+
+/// tools/call with a progressToken: progress notifications for this call
+/// stream out of the notification hub as ToolOutput events for `tool_id`.
+pub async fn call_tool_streaming(
+    transport: &dyn McpTransport,
+    tool_name: &str,
+    args: &Value,
+    tool_id: &str,
+    route: CallRoute<'_>,
+    events: &crate::types::EventSender,
+    payloads: Option<flume::Sender<Value>>,
+) -> Result<McpCallOutput, McpError> {
+    let Some(hub) = transport.notification_hub() else {
+        return call_tool(transport, tool_name, args).await;
+    };
+    let _guard = hub.watch_progress(tool_id, Arc::from(tool_id), events.clone(), payloads);
+    let mut meta = serde_json::json!({ "progressToken": tool_id });
+    if let Some(sid) = route.session_id {
+        meta["maki_session_id"] = Value::from(sid);
+    }
+    if let Some(tid) = route.task_id {
+        meta["maki_task_id"] = Value::from(tid);
+    }
+    meta["maki_output_mode"] = Value::from(route.output_mode.as_str());
+    let params = serde_json::json!({
+        "name": tool_name,
+        "arguments": args,
+        "_meta": meta,
+    });
+    call_tool_inner(transport, params).await
+}
+
+async fn call_tool_inner(
+    transport: &dyn McpTransport,
+    params: Value,
+) -> Result<McpCallOutput, McpError> {
+    let server = &**transport.server_name();
+    let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
+    let start = Instant::now();
     let result = transport.send_request("tools/call", Some(params)).await?;
     let call_result: CallToolResult =
         serde_json::from_value(result).map_err(|e| invalid_response(transport.server_name(), e))?;
@@ -186,6 +270,13 @@ pub async fn call_tool(
     let text = call_result.joined_text();
 
     if call_result.is_error {
+        if !call_result.instructions.is_empty() {
+            debug!(
+                server,
+                count = call_result.instructions.len(),
+                "dropping instruction blocks on an error result; the file stays unseen"
+            );
+        }
         return Err(McpError::RpcError {
             server: (**transport.server_name()).into(),
             code: -1,
@@ -203,6 +294,7 @@ pub async fn call_tool(
     Ok(McpCallOutput {
         text,
         image: call_result.image(),
+        instructions: call_result.instructions,
     })
 }
 

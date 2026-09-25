@@ -19,7 +19,7 @@ pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation, ToolReach,
-    ToolRegistry, ToolSource,
+    ToolRegistry, ToolSource, ViewDone, ViewHook, ViewStart,
 };
 
 use std::collections::HashMap;
@@ -345,6 +345,11 @@ pub struct ToolContext {
     pub loaded_instructions: LoadedInstructions,
     /// Per model call, shared with its nested calls.
     pub call_instructions: CallInstructions,
+    /// Whether this dispatch attaches found instruction blocks to its own
+    /// output. False only in the split executor, whose ctx is rebuilt every
+    /// call: it ships the blocks out-of-band on the tools/call result, and
+    /// the brain attaches them against its session-long seen-set.
+    pub attach_instructions: bool,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
@@ -581,6 +586,7 @@ pub fn interpreter_ctx(
         reauth: false,
         loaded_instructions: LoadedInstructions::new(),
         call_instructions: CallInstructions::default(),
+        attach_instructions: true,
         cancel,
         mcp: None,
         deadline: Deadline::default(),

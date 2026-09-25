@@ -132,6 +132,7 @@ The rules:
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
+| [`maki.mcp`](#maki-mcp) | MCP resource registration. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP and plain TCP for plugins. |
 | [`maki.net.Conn`](#maki-net-Conn) | A TCP connection opened by `maki.net.connect`. |
@@ -620,6 +621,64 @@ maki.api.register_command({
   handler = function()
     maki.ui.flash("Hello from my plugin!")
   end,
+})
+```
+
+---
+
+### `maki.api.register_tool_view()` {#maki-api-register_tool_view}
+
+```lua
+maki.api.register_tool_view({spec})
+```
+
+Register the view for a tool this host never runs: an MCP tool, e.g. the
+executor's tools in the brain/executor split. The view is the tool's whole
+presentation, painted with the full `maki.ui` surface from the brain's own
+Lua host; the executor only executes and emits progress.
+
+Callbacks (at least one required):
+  start(input, ctx)                  Paint the preview, exactly like a
+    tool's own `start` (`ctx:live_buf`, `maki.ui`, config reads). May
+    return a per-call state value, which `progress` and `done` get back,
+    and optionally a header summary as the second return.
+  progress(state, payload)           One call per payload the tool emits
+    with `ctx:progress(...)`; the payload's JSON shape is the tool's own
+    contract with its view.
+  done(state, input, output, is_error)   Paint the final body.
+
+Executor-role hosts reject this: views are UI-side. A native tool with its
+own `header`/`start` keeps it; the view serves tools that have neither.
+One view per tool name; a later registration replaces an earlier one.
+
+Session restore replays `start(input)` then `done(state, input, output)` —
+no live executor needed, and the restored row keeps its click handlers.
+`ctx:live_buf` in `start` publishes the body to restore from; a view
+without `start` leaves restores to generic rendering.
+
+**Parameters:**
+
+- `{spec}` (`table`) View specification:
+  - `tool` (`string`) Required. Qualified tool name (`server.tool`); the
+    executor's own tools keep their bare names.
+  - `start` (`function`) Optional. `function(input, ctx) -> state[, summary]`.
+  - `progress` (`function`) Optional. `function(state, payload)`.
+  - `done` (`function`) Optional. `function(state, input, output, is_error)`.
+
+**Example:**
+
+```lua
+maki.api.register_tool_view({
+  tool = "python",
+  start = function(input, ctx)
+    local buf = maki.ui.buf()
+    for _, line in ipairs(maki.ui.highlight(input.code or "", "py") or {}) do
+      buf:line(line)
+    end
+    ctx:live_buf(buf)
+    return { buf = buf }, "running python"
+  end,
+  done = function(state) state.buf:line({ { "done", "dim" } }) end,
 })
 ```
 
@@ -2649,6 +2708,34 @@ end
 
 ---
 
+### `maki.fn.has()` {#maki-fn-has}
+
+```lua
+maki.fn.has({what})
+```
+
+Report which side of the brain/executor split this host is, for plugins
+that carry both kinds of code and pick at load time. "split" answers
+whether any split applies, so a plugin can load in single-process mode
+and on the executor but skip a split brain. Single-process maki answers
+"brain": there is no executor to distinguish.
+
+**Parameters:**
+
+- `{what}` (`string`) `"executor"`, `"brain"`, or `"split"`.
+
+**Returns:** (`integer`) `1` when the host runs in that role, `0` otherwise.
+
+**Example:**
+
+```lua
+if maki.fn.has("split") == 0 then
+  -- register a tool; only possible without a split
+end
+```
+
+---
+
 ### `maki.fn.winsaveview()` {#maki-fn-winsaveview}
 
 ```lua
@@ -2972,6 +3059,32 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 ```lua
 local root = maki.fs.root("src/main.rs", { ".git", "Cargo.toml" })
 if root then print("project root: " .. root) end
+```
+
+---
+
+### `maki.fs.git_branch()` {#maki-fs-git_branch}
+
+```lua
+maki.fs.git_branch({path})
+```
+
+Return the checked-out branch of the git repository containing {path},
+or the short HEAD hash when detached. Relative paths resolve from the
+current working directory. Worktree `.git` files are followed.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute or relative path inside the repository.
+
+**Returns:** (`string?`) Branch name or short hash, or nil outside a repository.
+
+**Example:**
+
+```lua
+local branch = maki.fs.git_branch("src") -- "main"
 ```
 
 ---
@@ -3951,6 +4064,52 @@ Emit an ERROR-level log message. Use for failures that need attention.
 
 ```lua
 maki.log.error("failed to connect to API")
+```
+
+
+## maki.mcp {#maki-mcp}
+
+MCP resource registration. What a plugin registers here, the executor
+serves to the brain over the split-mode MCP endpoint.
+
+```lua
+maki.mcp.register_resource({
+  uri = "maki://git/branch",
+  read = function() return maki.fs.git_branch(".") or "" end,
+})
+```
+
+---
+
+### `maki.mcp.register_resource()` {#maki-mcp-register_resource}
+
+```lua
+maki.mcp.register_resource({spec})
+```
+
+Register {spec.uri} as an MCP resource this plugin serves, answered by
+{spec.read}. The executor's endpoint lists every registered URI on
+`resources/list` and routes a `resources/read` for one to its `read`.
+
+`read` is called with the requested URI and follows the `(value, err)`
+convention: a string is the resource's text content, nil plus an error
+message fails the read.
+
+One provider per URI; registering an already-registered URI replaces its
+provider. `file://` URIs are refused: that scheme is the workspace file
+corpus, served by the host itself.
+
+**Parameters:**
+
+- `{spec}` (`table`) `{ uri = string, read = function }`
+
+**Example:**
+
+```lua
+maki.mcp.register_resource({
+  uri = "maki://git/branch",
+  read = function() return maki.fs.git_branch(".") or "" end,
+})
 ```
 
 
@@ -6678,7 +6837,8 @@ every case.
   - `independent` (`boolean`) highlight each line without cross-line context. Default false.
   - `prefix` (`string`) prepend to the source before highlighting (affects token context). Default "".
 
-**Returns:** (`table`) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
+**Returns:** (`table?`) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
+Executor-role hosts return nil; the brain renders split views.
 
 **Example:**
 
@@ -7721,6 +7881,7 @@ return M
 -- shows a directory the same way. Listing also loads the directory's
 -- instruction files onto the call.
 function M.list(path, ctx)
+function M.opts(ctx)
 function M.view(text, ctx)
 ```
 
@@ -8036,6 +8197,10 @@ function ToolView.restore_lines(lines, opts)
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
+
+-- Same render into an existing buf: a brain-side view's `done` gets no ctx to
+-- publish a buf with, so it fills the one its `start` published.
+function ToolView.populate(buf, text, opts)
 
 -- Same, for tools whose live output goes through markdown (`format =
 -- "markdown"`). {opts.width} is the wrap width and defaults to the body

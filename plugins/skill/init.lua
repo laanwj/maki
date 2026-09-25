@@ -5,10 +5,10 @@ local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
+local view_shared = require("skill_view")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 local format_output = helpers.format_output
-local parse_output = helpers.parse_output
 
 local PROJECT_SKILL_DIRS = {
   ".maki/skills",
@@ -115,6 +115,15 @@ local function discover_skills()
     scan_skill_dir(maki.fs.joinpath(config, "skills"), skills)
   end
 
+  -- In the brain/executor split the executor's global skills arrive with the
+  -- handshake (its config dir may not even be mounted) and land here.
+  if maki.fn.has("executor") == 1 then
+    local state = maki.env.state_dir()
+    if state then
+      scan_skill_dir(maki.fs.joinpath(state, "executor", "skills"), skills)
+    end
+  end
+
   local home = maki.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
@@ -131,26 +140,14 @@ local function discover_skills()
   return skills
 end
 
-local function view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 20, keep = "head" }
-end
-
 -- Live call and restore both draw from the llm text, so the two views
 -- cannot drift. Nil when the text is not a skill listing.
 local function skill_view(output, ctx)
-  local location, content = parse_output(output)
+  local buf = maki.ui.buf()
+  local location = view_shared.populate_output(buf, output, view_shared.view_opts(ctx))
   if not location then
     return nil
   end
-
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, view_opts(ctx))
-  buf:on("click", function()
-    view:toggle()
-  end)
-  view:set_highlight(content, location:match("%.([^%.]+)$") or "md")
-  view:finish()
 
   local header = maki.ui.buf()
   header:line({ { shorten_path(location), "path" } })
@@ -178,7 +175,7 @@ maki.api.register_tool({
   end,
 
   restore = function(_input, output, _is_error, ctx)
-    return skill_view(output, ctx) or ToolView.restore(output, view_opts(ctx))
+    return skill_view(output, ctx) or ToolView.restore(output, view_shared.view_opts(ctx))
   end,
 
   handler = function(input, ctx)

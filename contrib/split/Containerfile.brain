@@ -1,0 +1,42 @@
+# Brain image for split mode: the maki binary, CA roots, micro as $EDITOR.
+# No shell and no coreutils: there is almost nothing to run in here.
+#
+#   podman build -f contrib/split/Containerfile.brain -t localhost/maki-brain .
+#
+# MAKI_VERSION and MAKI_SHA256 move together. The digests are the release
+# asset's sha256, so a retagged release fails the build instead of swapping
+# the binary.
+FROM debian:trixie-slim AS fetch
+
+ARG MAKI_VERSION=v0.5.6
+ARG MAKI_SHA256=4864b79237c70b8292f120c1b17a52cdaca7a7af3db0baed2c2da3dae41d7dcd
+ARG MICRO_VERSION=2.0.15
+ARG MICRO_SHA256=267d238eac1e26ed053d13d4d48bd421b87f9eb538b604f0b2f74a85598b6cc2
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl findutils \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /fetch
+RUN curl -fsSLO "https://github.com/tontinton/maki/releases/download/${MAKI_VERSION}/maki-${MAKI_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+ && echo "${MAKI_SHA256}  maki-${MAKI_VERSION}-x86_64-unknown-linux-musl.tar.gz" | sha256sum -c - \
+ && mkdir maki-out && tar -xzf "maki-${MAKI_VERSION}-x86_64-unknown-linux-musl.tar.gz" -C maki-out \
+ && install -D "$(find maki-out -type f -name maki | head -1)" /fetch/bin/maki
+
+RUN curl -fsSLO "https://github.com/micro-editor/micro/releases/download/v${MICRO_VERSION}/micro-${MICRO_VERSION}-linux64-static.tar.gz" \
+ && echo "${MICRO_SHA256}  micro-${MICRO_VERSION}-linux64-static.tar.gz" | sha256sum -c - \
+ && tar -xzf "micro-${MICRO_VERSION}-linux64-static.tar.gz" \
+ && install -D "micro-${MICRO_VERSION}/micro" /fetch/bin/micro
+
+# scratch has no /tmp, and maki writes its $EDITOR prompt buffers there.
+RUN install -d -m 1777 /fetch/tmp && install -d -o 1000 -g 1000 /fetch/home/maki
+
+FROM scratch
+COPY --from=fetch /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=fetch /fetch/bin/ /usr/local/bin/
+COPY --from=fetch /fetch/tmp /tmp
+COPY --from=fetch /fetch/home /home
+ENV HOME=/home/maki EDITOR=micro VISUAL=micro
+WORKDIR /home/maki
+USER 1000
+ENTRYPOINT ["maki"]

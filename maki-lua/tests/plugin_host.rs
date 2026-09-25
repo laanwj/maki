@@ -2496,7 +2496,7 @@ fn memory_pressure_evicts_warm_views_and_recovers_allocations() {
     const CALLS: usize = 24;
     const PROBE_BYTES: usize = 16 * 1024 * 1024;
     let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let host = PluginHost::executor(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"local ballast_calls = 0
         maki.api.register_tool({{

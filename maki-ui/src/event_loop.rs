@@ -108,6 +108,12 @@ pub struct EventLoopParams {
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
+    /// Brain/executor split: the config push for the executor's handshake.
+    /// `Some` means this process runs as the brain.
+    pub executor_push: Option<maki_agent::mcp::push::ExecutorPush>,
+    /// The executor's socket from --executor-socket/MAKI_EXECUTOR_SOCKET or
+    /// the reserved mcp.toml entry.
+    pub executor_socket: Option<std::path::PathBuf>,
     pub input_history_size: usize,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
@@ -413,12 +419,14 @@ struct SpawnCtx {
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust_question: Option<TrustQuestion>,
+    split_mode: bool,
 }
 
 impl SpawnCtx {
     fn spawn_runtime(&self, open: OpenSession, slot: Arc<ModelSlot>) -> SessionRuntime {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
+        let session_cwd = open.session.cwd.clone();
         let permissions = Arc::new(self.permissions.fork());
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
@@ -461,6 +469,17 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
         );
         app.trust_question = self.trust_question.clone();
+        app.split_mode = self.split_mode;
+        if self.split_mode {
+            // The bar's own cwd is this container's home; the project is the
+            // executor's, recorded in the session. The branch half is fetched
+            // from the executor: the .git it would be read from lives there.
+            app.status_bar.set_cwd(session_cwd);
+            if let Some(handle) = &self.mcp_handle {
+                let (rx, fetch) = spawn_branch_fetcher(handle.clone());
+                app.status_bar.attach_remote_branch(rx, fetch);
+            }
+        }
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
@@ -479,6 +498,34 @@ impl SpawnCtx {
             slot: cell,
         }
     }
+}
+
+/// Split mode: the workspace's .git lives on the executor, so the branch is
+/// fetched over MCP instead of watched on the local fs. A message on the
+/// returned sender triggers a fetch; every finished fetch lands on the
+/// receiver, failures included, as `None` (a branchless label, not an error).
+fn spawn_branch_fetcher(handle: McpHandle) -> (flume::Receiver<Option<String>>, flume::Sender<()>) {
+    let (branch_tx, branch_rx) = flume::bounded(1);
+    let (fetch_tx, fetch_rx) = flume::bounded::<()>(1);
+    smol::spawn(async move {
+        while fetch_rx.recv_async().await.is_ok() {
+            let branch = handle
+                .read_resource(
+                    mcp::config::EXECUTOR_SERVER_NAME,
+                    maki_agent::git::BRANCH_RESOURCE_URI,
+                )
+                .await
+                .ok()
+                .and_then(|contents| contents.into_iter().find_map(|c| c.text))
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty());
+            if branch_tx.send_async(branch).await.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+    (branch_rx, fetch_tx)
 }
 
 pub(crate) struct EventLoop<'t> {
@@ -501,6 +548,10 @@ pub(crate) struct EventLoop<'t> {
     ui_attachment: UiAttachment,
     pack_tx: flume::Sender<Box<PackPreparation>>,
     pack_rx: flume::Receiver<Box<PackPreparation>>,
+    /// Brain/executor split: executor log messages (plugin notifications),
+    /// and whether this process is the brain.
+    executor_rx: Option<flume::Receiver<String>>,
+    split_mode: bool,
     /// One package command at a time. The work runs on its own thread, so
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
@@ -520,9 +571,13 @@ enum Wake {
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
+    ExecutorMessage(String),
     Pack(Box<PackPreparation>),
     ModelsDiscovered,
 }
+
+const SPLIT_EDITOR_DISABLED: &str =
+    "open_editor is disabled in split mode; the file lives on the executor host";
 
 struct BackgroundModels {
     available: Arc<ArcSwapOption<ModelList>>,
@@ -607,7 +662,10 @@ impl<'t> EventLoop<'t> {
             model_policy,
             project_config,
             trust_question,
+            executor_push,
+            executor_socket,
         } = params;
+        let split_mode = executor_push.is_some();
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
         ui_attachment.attach();
@@ -632,7 +690,29 @@ impl<'t> EventLoop<'t> {
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd, project_config));
+        let (mcp_handle, mcp_config_errors, executor_rx) = smol::block_on(async {
+            if let Some(push) = executor_push {
+                let (handle, errors) =
+                    mcp::start_brain(&cwd, project_config, Some(push), executor_socket).await;
+                // Split mode without a live executor is a brain with no
+                // workspace tools; fail the boot, not the user's session.
+                match &handle {
+                    Some(handle) => mcp::executor_ready(handle, Duration::from_secs(15))
+                        .await
+                        .map_err(|reason| eyre!("executor unavailable in split mode: {reason}"))?,
+                    None => {
+                        return Err(eyre!("split mode is on but the executor is not configured"));
+                    }
+                }
+                let rx = handle
+                    .as_ref()
+                    .and_then(|h| h.watch_messages(mcp::config::EXECUTOR_SERVER_NAME));
+                Ok((handle, errors, rx))
+            } else {
+                let (handle, errors) = mcp::start(&cwd, project_config).await;
+                Ok((handle, errors, None))
+            }
+        })?;
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -668,6 +748,7 @@ impl<'t> EventLoop<'t> {
             storage_writer,
             model_policy,
             trust_question,
+            split_mode,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -724,6 +805,8 @@ impl<'t> EventLoop<'t> {
             ui_attachment,
             pack_tx,
             pack_rx,
+            executor_rx,
+            split_mode,
             pack_running: false,
             _model_fetch_task: bg.task,
         })
@@ -838,6 +921,11 @@ impl<'t> EventLoop<'t> {
             });
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
+        if let Some(rx) = &self.executor_rx
+            && !rx.is_disconnected()
+        {
+            sel = sel.recv(rx, |res| res.ok().map(Wake::ExecutorMessage));
+        }
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         sel = sel.recv(&self.models_rx, |res| {
             res.ok().map(|()| Wake::ModelsDiscovered)
@@ -864,6 +952,7 @@ impl<'t> EventLoop<'t> {
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
+            Wake::ExecutorMessage(message) => self.focused_app().flash(message),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
             Wake::ModelsDiscovered => self.rebuild_models(),
         }
@@ -981,8 +1070,16 @@ impl<'t> EventLoop<'t> {
                 }
             }
             UiAction::OpenEditor { path, reply_tx } => {
-                let code = self.open_editor(self.focused, &path);
-                let _ = reply_tx.send(code);
+                // Split mode: the workspace lives on the executor; only the
+                // brain's own state files (plans) can be edited here.
+                let plans_dir = self.ctx.storage.path().join("plans");
+                if self.split_mode && !path.starts_with(&plans_dir) {
+                    self.focused_app().flash(SPLIT_EDITOR_DISABLED.into());
+                    let _ = reply_tx.send(-1);
+                } else {
+                    let code = self.open_editor(self.focused, &path);
+                    let _ = reply_tx.send(code);
+                }
             }
             UiAction::OpenWin {
                 buf,
@@ -1096,6 +1193,11 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_status = status;
+            if status == SessionStatus::Idle {
+                // A bash-driven checkout during the turn is the realistic
+                // branch changer; a single-process bar ignores the request.
+                rt.app.status_bar.request_branch_fetch();
+            }
             handle.fire(
                 Some(&rt.id()),
                 HostEvent::SessionStatusChanged {

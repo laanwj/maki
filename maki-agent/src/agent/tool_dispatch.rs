@@ -19,7 +19,7 @@ use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT
 use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
     CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
-    ToolLive, truncate_bytes,
+    ToolLive, ViewDone, ViewHook, ViewStart, truncate_bytes,
 };
 use crate::{
     AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
@@ -180,7 +180,7 @@ pub async fn run(
     if let Some(hook) = &hook {
         hook.filter_output(&mut done, &input).await;
     }
-    if origin.is_model() {
+    if origin.is_model() && ctx.attach_instructions {
         attach_call_instructions(ctx, &mut done);
     }
     if let Some(source) = source {
@@ -630,6 +630,24 @@ async fn run_inner(
     }
 }
 
+async fn finish_view(
+    view: Option<&ViewHook>,
+    id: &str,
+    input: &Value,
+    output: String,
+    is_error: bool,
+) {
+    if let Some(view) = view {
+        (view.done)(ViewDone {
+            call_id: Arc::from(id),
+            input: input.clone(),
+            output,
+            is_error,
+        })
+        .await;
+    }
+}
+
 /// Parse errors skip the start event so the UI never shows a phantom spinner.
 #[allow(clippy::too_many_arguments)]
 async fn run_native_tool(
@@ -707,12 +725,30 @@ async fn run_native_tool(
         }
     }
 
-    let header_result = invocation.start_header().await;
+    // A registered view drives the display of a tool that has none of its
+    // own; the summary line is the one thing the header row always needs.
+    let view = ctx
+        .registry
+        .tool_view(&tool_id)
+        .filter(|_| origin.is_model() && !entry.tool.has_own_display());
+    let (summary, render_header) = if let Some(view) = &view {
+        let summary = (view.start)(ViewStart {
+            call_id: Arc::from(id.as_str()),
+            tool: Arc::clone(&tool_id),
+            input: input.clone(),
+            ctx: ctx.clone(),
+        })
+        .await;
+        (summary.unwrap_or_else(|| tool_id.to_string()), None)
+    } else {
+        let header_result = invocation.start_header().await;
+        (header_result.text(), header_result.snapshot())
+    };
     let start = ToolStartEvent {
         id: id.clone(),
         tool: Arc::clone(&tool_id),
-        summary: header_result.text(),
-        render_header: header_result.snapshot(),
+        summary,
+        render_header,
         annotation: invocation.start_annotation(),
         input: None,
         raw_input: Some(input.clone()),
@@ -726,6 +762,7 @@ async fn run_native_tool(
 
     if let Err(e) = enforce_permission(invocation.as_ref(), name, input, ctx, &id, ask, hook).await
     {
+        finish_view(view.as_ref(), &id, input, e.clone(), true).await;
         return done_error(e);
     }
 
@@ -742,6 +779,7 @@ async fn run_native_tool(
             if ctx.config.stale_read_check
                 && let Err(message) = ctx.file_access.check_before_edit(key)
             {
+                finish_view(view.as_ref(), &id, input, message.clone(), true).await;
                 return done_error(message);
             }
             Some(guard)
@@ -750,6 +788,14 @@ async fn run_native_tool(
     };
 
     let result = invocation.execute(ctx).await;
+
+    if view.is_some() {
+        let (output, is_error) = match &result.output {
+            Ok(output) => (output.as_text(), false),
+            Err(message) => (message.clone(), true),
+        };
+        finish_view(view.as_ref(), &id, input, output, is_error).await;
+    }
 
     // Nothing else could have touched the file while the guard was held, so the
     // mtime is refreshed here instead of by each write plugin remembering to.
@@ -1043,15 +1089,39 @@ async fn execute_mcp_tool(
     ask: Option<&str>,
     hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
-    let view = RoutedView::mcp(&tool);
-    emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
+    let routed = RoutedView::mcp(&tool);
+    // A registered view is the tool's whole presentation: it paints the
+    // preview and the final body; the executor only executes.
+    let view = ctx.registry.tool_view(&tool).filter(|_| origin.is_model());
+    if let Some(view) = &view {
+        let summary = (view.start)(ViewStart {
+            call_id: Arc::from(id),
+            tool: Arc::clone(&tool),
+            input: input.clone(),
+            ctx: ctx.clone(),
+        })
+        .await;
+        let start = ToolStartEvent {
+            id: id.to_owned(),
+            tool: Arc::clone(&tool),
+            summary: summary.unwrap_or_else(|| tool.to_string()),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: Some(input.clone()),
+            output: None,
+        };
+        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+    } else {
+        emit_raw_start(ctx, origin, id, &tool, routed.summary.clone(), input);
+    }
     let done = |output: TextOutput, image: Option<maki_providers::ImageSource>, is_error: bool| {
         let output = match image {
             Some(source) => ToolOutput::Image {
                 source,
                 text: output.text,
             },
-            None => view.output(output),
+            None => routed.output(output),
         };
         ToolDoneEvent {
             call: None,
@@ -1064,34 +1134,102 @@ async fn execute_mcp_tool(
         }
     };
 
-    let perm_tool = match ToolKey::parse(&tool) {
-        Ok(k) => k,
-        Err(e) => {
-            return done(
-                format!("invalid MCP tool key '{tool}': {e}").into(),
+    let result: Result<(TextOutput, Option<maki_providers::ImageSource>, bool), String> = async {
+        let perm_tool =
+            ToolKey::parse(&tool).map_err(|e| format!("invalid MCP tool key '{tool}': {e}"))?;
+        gate_on_input(ctx, &perm_tool, id, input, ask, hook).await?;
+
+        // Only a permitted call loads the tool.
+        let loaded_tools = mcp.load_called(&tool, origin, ToolDeferral::for_model(&ctx.model));
+        // The view's progress feed rides next to the text one; the pump
+        // drains it into the view until the call's progress guard drops.
+        let (payloads, pump) = match &view {
+            Some(view) => {
+                let (tx, rx) = flume::unbounded::<Value>();
+                let progress = Arc::clone(&view.progress);
+                let call_id: Arc<str> = Arc::from(id);
+                // Tool bodies repaint when an agent event wakes the loop, so
+                // each payload follows its view update with one.
+                let pump_events = ctx.event_tx.clone();
+                let pump = smol::spawn(async move {
+                    while let Ok(payload) = rx.recv_async().await {
+                        progress(Arc::clone(&call_id), payload.clone()).await;
+                        pump_events.try_send(AgentEvent::ToolProgress {
+                            id: call_id.to_string(),
+                            payload,
+                        });
+                    }
+                });
+                (Some(tx), Some(pump))
+            }
+            None => (None, None),
+        };
+        let result = ctx
+            .cancel
+            .race(mcp.call_tool_streaming(
+                &tool,
+                input,
+                id,
+                crate::mcp::transport::CallRoute {
+                    session_id: ctx.session_id.as_ref().map(|s| s.as_str()),
+                    task_id: ctx.task_id.as_deref(),
+                    output_mode: ctx.output_mode,
+                },
+                &ctx.event_tx,
+                payloads,
+            ))
+            .await;
+        if let Some(pump) = pump {
+            pump.await;
+        }
+        Ok(match result {
+            Ok(Ok(out)) => {
+                // The executor's found blocks ride the result out-of-band; the
+                // attach happens at this dispatch's model-origin layer, against
+                // the session-long set, exactly like a native tool's blocks.
+                ctx.call_instructions.record(out.instructions);
+                (
+                    TextOutput {
+                        loaded_tools,
+                        ..out.text.into()
+                    },
+                    out.image,
+                    false,
+                )
+            }
+            Ok(Err(e)) => (
+                TextOutput {
+                    loaded_tools,
+                    ..e.to_string().into()
+                },
                 None,
                 true,
-            );
-        }
-    };
-    if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask, hook).await {
-        return done(e.into(), None, true);
+            ),
+            Err(cancelled) => (
+                TextOutput {
+                    loaded_tools,
+                    ..cancelled.into()
+                },
+                None,
+                true,
+            ),
+        })
     }
-
-    // Only a permitted call loads the tool.
-    let loaded_tools = mcp.load_called(&tool, origin, ToolDeferral::for_model(&ctx.model));
-    let (text, image, is_error) = match mcp.call_tool(&tool, input).await {
-        Ok(out) => (out.text, out.image, false),
-        Err(e) => (e.to_string(), None, true),
+    .await;
+    let (output, image, is_error) = match result {
+        Ok(done) => done,
+        Err(denied) => (denied.into(), None, true),
     };
-    done(
-        TextOutput {
-            loaded_tools,
-            ..text.into()
-        },
-        image,
-        is_error,
-    )
+    if let Some(view) = &view {
+        (view.done)(ViewDone {
+            call_id: Arc::from(id),
+            input: input.clone(),
+            output: output.text.clone(),
+            is_error,
+        })
+        .await;
+    }
+    done(output, image, is_error)
 }
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
@@ -1399,6 +1537,45 @@ mod tests {
         with_mcp(stub_ctx(&AgentMode::Build), mcp)
     }
 
+    /// A transport that parks every request forever, signalling when one
+    /// arrived so a test can cancel a call it knows is in flight.
+    struct HangingTransport {
+        entered: flume::Sender<()>,
+    }
+
+    impl crate::mcp::transport::McpTransport for HangingTransport {
+        fn send_request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> crate::mcp::transport::BoxFuture<'a, Result<Value, crate::mcp::error::McpError>>
+        {
+            Box::pin(async move {
+                let _ = self.entered.send_async(()).await;
+                std::future::pending().await
+            })
+        }
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> crate::mcp::transport::BoxFuture<'a, Result<(), crate::mcp::error::McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown<'a>(&'a self) -> crate::mcp::transport::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn server_name(&self) -> &Arc<str> {
+            static NAME: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+            NAME.get_or_init(|| Arc::from("hanging"))
+        }
+        fn transport_kind(&self) -> &'static str {
+            "hanging"
+        }
+    }
+
+    /// Serves one canned tools/call answer carrying a text block and an image
+    /// block, the shape a real MCP image tool (or the split executor) sends.
     struct ImageTransport;
 
     impl crate::mcp::transport::McpTransport for ImageTransport {
@@ -1436,6 +1613,8 @@ mod tests {
         }
     }
 
+    /// The pixels make it to the model: an MCP image block becomes an
+    /// Image output, and history carries it as a vision content block.
     #[test]
     fn an_mcp_image_result_becomes_an_image_output() {
         smol::block_on(async {
@@ -1443,7 +1622,7 @@ mod tests {
                 &[("img", "")],
                 Arc::new(ImageTransport),
             );
-            let ctx = mcp_ctx(&mcp);
+            let ctx = with_mcp(stub_ctx(&AgentMode::Build), &mcp);
             let done = dispatch(&ctx, "img", &serde_json::json!({})).await;
             assert!(!done.is_error, "got: {}", done.output.as_text());
             let crate::ToolOutput::Image { source, text } = &*done.output else {
@@ -1459,6 +1638,32 @@ mod tests {
                     .any(|b| matches!(b, maki_providers::ContentBlock::Image { .. })),
                 "history must carry the image"
             );
+        });
+    }
+
+    #[test]
+    fn mcp_call_honours_cancellation() {
+        smol::block_on(async {
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let mcp = crate::mcp::test_support::session_with_transport(
+                &[("stub.hang", "hangs")],
+                Arc::new(HangingTransport {
+                    entered: entered_tx,
+                }),
+            );
+            let mut ctx = mcp_ctx(&mcp);
+            let (trigger, token) = CancelToken::new();
+            ctx.cancel = token;
+            let task_ctx = ctx.clone();
+            let call =
+                smol::spawn(async move { dispatch(&task_ctx, "stub.hang", &json!({})).await });
+            // The call is parked in the transport, so the cancel lands in a
+            // running call rather than racing one that has not started.
+            entered_rx.recv_async().await.unwrap();
+            trigger.cancel();
+            let done = call.await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), "cancelled");
         });
     }
 
@@ -2441,6 +2646,122 @@ mod tests {
         });
     }
 
+    /// Answers tools/call with a fixed text plus one instruction block: the
+    /// shape a split executor's result carries, blocks out-of-band.
+    struct InstructedTransport;
+
+    impl crate::mcp::transport::McpTransport for InstructedTransport {
+        fn send_request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> crate::mcp::transport::BoxFuture<'a, Result<Value, crate::mcp::error::McpError>>
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": CHILD_TEXT }],
+                    "instructions": [{
+                        "path": INSTRUCTION_PATH,
+                        "content": INSTRUCTION_CONTENT,
+                    }],
+                }))
+            })
+        }
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> crate::mcp::transport::BoxFuture<'a, Result<(), crate::mcp::error::McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown<'a>(&'a self) -> crate::mcp::transport::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn server_name(&self) -> &Arc<str> {
+            static NAME: std::sync::LazyLock<Arc<str>> =
+                std::sync::LazyLock::new(|| Arc::from("instructed"));
+            &NAME
+        }
+        fn transport_kind(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    const INSTRUCTED_MCP_TOOL: &str = "stub__instructed";
+
+    fn instructed_session() -> McpSession {
+        crate::mcp::test_support::session_with_transport(
+            &[("stub.instructed", "")],
+            Arc::new(InstructedTransport),
+        )
+    }
+
+    /// The split executor has no session state, so its found blocks arrive on
+    /// every result; the brain attaches them against its session-long
+    /// seen-set, which is what keeps them once per session.
+    #[test]
+    fn mcp_tool_instructions_surface_once_per_session() {
+        smol::block_on(async {
+            let ctx = mcp_ctx(&instructed_session());
+
+            let first = dispatch(&ctx, INSTRUCTED_MCP_TOOL, &serde_json::json!({})).await;
+            assert!(!first.is_error);
+            assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
+            let text = first.output.as_text();
+            assert!(text.starts_with(CHILD_TEXT));
+            assert_eq!(text.matches(INSTRUCTION_CONTENT).count(), 1);
+            assert!(
+                ctx.loaded_instructions
+                    .contains(&PathBuf::from(INSTRUCTION_PATH)),
+                "attaching is what marks the file seen"
+            );
+
+            let second = dispatch(&ctx, INSTRUCTED_MCP_TOOL, &serde_json::json!({})).await;
+            assert!(
+                second.output.instructions().is_none(),
+                "the session set filters the second call"
+            );
+            assert_eq!(second.output.as_text(), CHILD_TEXT);
+        });
+    }
+
+    /// A nested MCP call (a batch child) records onto the shared
+    /// per-model-call handle, so its blocks land on the enclosing model
+    /// call's output, not on the child's own text.
+    #[test]
+    fn nested_mcp_tool_instructions_ride_up_to_the_model_call() {
+        smol::block_on(async {
+            let mut ctx = mcp_ctx(&instructed_session());
+            ctx.local_tools = Arc::new(HashMap::from([(
+                PARENT_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), |_, ctx| {
+                    Box::pin(async move {
+                        let child =
+                            dispatch_nested(&ctx, INSTRUCTED_MCP_TOOL, &serde_json::json!({}))
+                                .await;
+                        Ok(child.output.as_text())
+                    })
+                }),
+            )]));
+
+            let done = dispatch(&ctx, PARENT_TOOL, &serde_json::json!({})).await;
+            let text = done.output.as_text();
+            assert_eq!(done.output.instructions().map(<[_]>::len), Some(1));
+            assert!(text.starts_with(CHILD_TEXT));
+            assert_eq!(
+                text.matches(INSTRUCTION_CONTENT).count(),
+                1,
+                "the parent forwards the child's text verbatim, so a block in it would show twice"
+            );
+            assert!(ctx.call_instructions.take().is_empty());
+            assert!(
+                ctx.loaded_instructions
+                    .contains(&PathBuf::from(INSTRUCTION_PATH)),
+                "attaching is what marks the file seen"
+            );
+        });
+    }
+
     #[test]
     fn functions_prefixed_name_dispatches_to_canonical_tool() {
         smol::block_on(async {
@@ -2479,6 +2800,144 @@ mod tests {
             assert_eq!(start.tool.as_ref(), "local_echo");
             assert_eq!(start.summary, "local_echo");
             assert_eq!(start.raw_input, Some(input));
+        });
+    }
+
+    #[test]
+    fn mcp_tool_runs_through_a_registered_view() {
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(tx, 0);
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let mut ctx =
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+            ctx.mcp = Some(mcp);
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let start_calls = Arc::clone(&calls);
+            let done_calls = Arc::clone(&calls);
+            ctx.registry.set_view(
+                PROBE_QUALIFIED,
+                crate::tools::ViewHook {
+                    start: Arc::new(move |vs: crate::tools::ViewStart| {
+                        start_calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("start:{}", vs.input["code"].as_str().unwrap_or("")));
+                        Box::pin(async { Some("custom header".to_string()) })
+                    }),
+                    progress: Arc::new(|_, _| Box::pin(async {})),
+                    done: Arc::new(move |vd: crate::tools::ViewDone| {
+                        done_calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("done:{}:{}", vd.output, vd.is_error));
+                        Box::pin(async {})
+                    }),
+                },
+            );
+
+            let input = serde_json::json!({ "code": "print(1)" });
+            let done = dispatch(&ctx, PROBE_WIRE, &input).await;
+            let envelope = rx.try_recv().expect("ToolStart must be emitted");
+            let AgentEvent::ToolStart(start) = envelope.event else {
+                panic!("expected ToolStart, got {:?}", envelope.event);
+            };
+            assert_eq!(start.summary, "custom header");
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2, "start and done, in order: {calls:?}");
+            assert_eq!(calls[0], "start:print(1)");
+            assert!(calls[1].starts_with("done:"), "got: {}", calls[1]);
+            // The stub transport fails every call by design; done still ran.
+            assert!(done.is_error);
+            assert!(done.output.as_text().contains("tools/call"));
+        });
+    }
+
+    /// The single-process half of views: a native tool with no display of its
+    /// own is driven by a registered view, same lifecycle as the MCP path.
+    #[test]
+    fn native_tool_without_own_display_runs_through_a_view() {
+        smol::block_on(async {
+            struct BareTool;
+            struct BareInvocation;
+            impl crate::tools::registry::ToolInvocation for BareInvocation {
+                fn start_header(&self) -> crate::tools::HeaderFuture {
+                    crate::tools::HeaderFuture::Ready(crate::tools::HeaderResult::plain(
+                        "bare".into(),
+                    ))
+                }
+                fn execute<'a>(
+                    self: Box<Self>,
+                    _ctx: &'a ToolContext,
+                ) -> crate::tools::ExecFuture<'a> {
+                    Box::pin(async { Ok(ToolOutput::Plain("ran".into())).into() })
+                }
+            }
+            impl crate::tools::registry::Tool for BareTool {
+                fn name(&self) -> &str {
+                    "bare"
+                }
+                fn description(&self, _: &crate::tools::DescriptionContext) -> Cow<'_, str> {
+                    "d".into()
+                }
+                fn schema(&self) -> Value {
+                    serde_json::json!({"type": "object", "properties": {}})
+                }
+                fn parse(
+                    &self,
+                    _: &Value,
+                ) -> Result<Box<dyn crate::tools::ToolInvocation>, crate::tools::ParseError>
+                {
+                    Ok(Box::new(BareInvocation))
+                }
+                fn has_own_display(&self) -> bool {
+                    false
+                }
+            }
+
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(tx, 0);
+            let registry = ToolRegistry::new();
+            register(&registry, Arc::new(BareTool));
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let start_calls = Arc::clone(&calls);
+            let done_calls = Arc::clone(&calls);
+            registry.set_view(
+                "bare",
+                crate::tools::ViewHook {
+                    start: Arc::new(move |vs: crate::tools::ViewStart| {
+                        start_calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("start:{}", vs.input["flag"].as_str().unwrap_or("")));
+                        Box::pin(async { Some("view header".to_string()) })
+                    }),
+                    progress: Arc::new(|_, _| Box::pin(async {})),
+                    done: Arc::new(move |vd: crate::tools::ViewDone| {
+                        done_calls
+                            .lock()
+                            .unwrap()
+                            .push(format!("done:{}:{}", vd.output, vd.is_error));
+                        Box::pin(async {})
+                    }),
+                },
+            );
+            let mut ctx =
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
+            ctx.registry = Arc::new(registry);
+
+            let input = serde_json::json!({ "flag": "on" });
+            let done = dispatch(&ctx, "bare", &input).await;
+            assert!(!done.is_error);
+            let envelope = rx.try_recv().expect("ToolStart must be emitted");
+            let AgentEvent::ToolStart(start) = envelope.event else {
+                panic!("expected ToolStart, got {:?}", envelope.event);
+            };
+            assert_eq!(start.summary, "view header");
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec!["start:on".to_string(), "done:ran:false".to_string()]
+            );
         });
     }
 
@@ -3018,6 +3477,9 @@ mod tests {
                 executed: Arc::clone(&self.executed),
             }))
         }
+        fn has_own_display(&self) -> bool {
+            false
+        }
     }
 
     /// A denied tool should still get its preview, but never its `execute`.
@@ -3027,7 +3489,21 @@ mod tests {
             let mut ctx = denying_ctx(ToolKey::native(START_PROBE_NAME));
             let probe = StartProbe::default();
             let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
-            ctx.registry = registered(Arc::new(probe));
+            let registry = registered(Arc::new(probe));
+            let view_done = Arc::new(std::sync::Mutex::new(None));
+            let view_done_slot = Arc::clone(&view_done);
+            registry.set_view(
+                START_PROBE_NAME,
+                crate::tools::ViewHook {
+                    start: Arc::new(|_: crate::tools::ViewStart| Box::pin(async { None })),
+                    progress: Arc::new(|_, _| Box::pin(async {})),
+                    done: Arc::new(move |vd: crate::tools::ViewDone| {
+                        *view_done_slot.lock().unwrap() = Some((vd.output, vd.is_error));
+                        Box::pin(async {})
+                    }),
+                },
+            );
+            ctx.registry = registry;
 
             let done = dispatch(&ctx, START_PROBE_NAME, &serde_json::json!({})).await;
 
@@ -3039,6 +3515,11 @@ mod tests {
             assert!(
                 !executed.load(Ordering::SeqCst),
                 "execute must not run after denial"
+            );
+            assert_eq!(
+                *view_done.lock().unwrap(),
+                Some((done.output.as_text(), true)),
+                "denial must retire the started view"
             );
         });
     }

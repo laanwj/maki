@@ -232,14 +232,23 @@ fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 /// @param opts table? Options. Fields:
 ///   - independent (boolean): highlight each line without cross-line context. Default false.
 ///   - prefix (string): prepend to the source before highlighting (affects token context). Default "".
-/// @return (table) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
+/// @return (table?) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
+/// Executor-role hosts return nil; the brain renders split views.
 /// @example
 /// local lines = maki.ui.highlight("fn main() {}", "rust")
 /// for _, spans in ipairs(lines) do
 ///   buf:line(spans)
 /// end
 #[lua_fn]
-async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
+async fn highlight(
+    lua: Lua,
+    code: String,
+    lang: String,
+    opts: Option<Table>,
+) -> LuaResult<Option<Table>> {
+    if crate::role::current(&lua).is_executor() {
+        return Ok(None);
+    }
     let independent = opts
         .as_ref()
         .and_then(|t| t.opt_bool("independent"))
@@ -257,7 +266,7 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
         })
     })
     .await;
-    segments_to_lua_lines(&lua, &segments)
+    segments_to_lua_lines(&lua, &segments).map(Some)
 }
 
 /// Renders Markdown into styled lines ready to display in a buffer.
@@ -785,7 +794,30 @@ pub(crate) fn create_ui_table(
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
 
+    let role = crate::role::current(lua);
+    // flash doubles as maki.notify's transport, which the executor forwards
+    // to the brain as an MCP logging notification.
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    if role.is_executor() {
+        for name in [
+            "action",
+            "open_editor",
+            "input",
+            "input_edit",
+            "open_win",
+            "set_window_title",
+            "set_status_hint",
+        ] {
+            let what = format!("maki.ui.{name}");
+            t.set(
+                name,
+                lua.create_function(move |_, (): ()| -> LuaResult<()> {
+                    Err(crate::role::executor_gate_error(&what))
+                })?,
+            )?;
+        }
+        return Ok(t);
+    }
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     action__register(&t, lua, ui_action_tx.clone(), perms.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
@@ -1456,6 +1488,20 @@ mod tests {
         assert_eq!(span_style(&line, 1), STYLE_LIST_MARKER);
         assert_eq!(span_style(&line, 2), STYLE_BOLD);
         assert_eq!(span_text(&line, 2), "item");
+    }
+
+    #[test]
+    fn executor_highlight_returns_nil() {
+        let lua = Lua::new();
+        lua.set_app_data(crate::role::HostRole::Executor);
+        let lines = smol::block_on(highlight(
+            lua.clone(),
+            "fn main() {}".into(),
+            "rust".into(),
+            None,
+        ))
+        .unwrap();
+        assert!(lines.is_none());
     }
 
     #[test]

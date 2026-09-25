@@ -354,7 +354,14 @@ pub(crate) fn grant_hint(perms: &[Permission]) -> String {
         .map(|perm| format!("`{perm} = true`"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("Add {keys} under `[permissions]` in the {MANIFEST_FILE} next to the plugin file")
+    let annotation = perms
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "Add {keys} under `[permissions]` in the {MANIFEST_FILE} next to the plugin file, or add `---@permissions {annotation}` to the plugin source"
+    )
 }
 
 /// What a package's `plugin.toml` asks for.
@@ -526,6 +533,25 @@ pub(crate) fn check_plugin_compatibility(
         return Ok(());
     };
     check_minimum_version(plugin, required, RUNTIME_VERSION)
+}
+
+/// `---@permissions` annotations grant what they name; anything else stays
+/// denied. Shared by the push loader and the autoload scan.
+pub(crate) fn permissions_from_annotations(
+    plugin: &str,
+    annotations: &maki_config::PluginAnnotations,
+) -> Result<PluginPermissions, PluginError> {
+    let mut permissions = PluginPermissions::denied();
+    for permission_name in &annotations.permissions {
+        let Some(permission) = maki_config::Permission::from_key(permission_name) else {
+            return Err(PluginError::InvalidAnnotations {
+                plugin: plugin.into(),
+                message: format!("unknown permission {permission_name:?} in annotations"),
+            });
+        };
+        permissions.set(permission, true);
+    }
+    Ok(permissions)
 }
 
 fn load_plugin_manifest(plugin_dir: Option<&Path>) -> Option<toml::Value> {

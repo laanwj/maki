@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::InstructionBlock;
+
 pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[derive(Serialize)]
@@ -142,6 +144,12 @@ pub struct CallToolResult {
     pub content: Vec<CallToolContent>,
     #[serde(default, rename = "isError")]
     pub is_error: bool,
+    /// Instruction blocks a maki executor found while the tool ran. They ride
+    /// out-of-band instead of appended to the text, so the brain can attach
+    /// them against its session-long seen-set; every other server leaves the
+    /// field empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instructions: Vec<InstructionBlock>,
 }
 
 impl CallToolResult {
@@ -270,6 +278,30 @@ mod tests {
         let result: CallToolResult = serde_json::from_value(raw).unwrap();
         assert!(result.is_error);
         assert_eq!(result.joined_text(), "hello");
+    }
+
+    #[test]
+    fn call_tool_result_carries_instructions_out_of_band() {
+        let raw = json!({
+            "content": [{"type": "text", "text": "done"}],
+            "instructions": [{"path": "/repo/sub/AGENTS.md", "content": "rules"}],
+        });
+        let result: CallToolResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(result.joined_text(), "done");
+        assert_eq!(result.instructions.len(), 1);
+        assert_eq!(result.instructions[0].path, "/repo/sub/AGENTS.md");
+        assert_eq!(result.instructions[0].content, "rules");
+
+        let with_blocks = serde_json::to_value(&result).unwrap();
+        assert!(with_blocks.get("instructions").is_some());
+        let bare = json!({"content": [{"type": "text", "text": "done"}]});
+        let result: CallToolResult = serde_json::from_value(bare).unwrap();
+        assert!(result.instructions.is_empty(), "old servers omit the field");
+        let without_blocks = serde_json::to_value(&result).unwrap();
+        assert!(
+            without_blocks.get("instructions").is_none(),
+            "empty never hits the wire"
+        );
     }
 
     #[test]

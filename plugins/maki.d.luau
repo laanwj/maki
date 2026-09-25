@@ -22,6 +22,7 @@ declare maki: {
     register_tool: @checked (spec: any) -> (),
     register_permission_rule: @checked (spec: any) -> (),
     register_command: @checked (spec: any) -> (),
+    register_tool_view: @checked (spec: any) -> (),
     register_prompt_hint: @checked (spec: any) -> (),
     register_options: @checked (spec: any) -> (any),
     set_prompt: @checked (spec: any) -> (),
@@ -66,6 +67,7 @@ declare maki: {
     jobattach: @checked (job_id: number, opts: any) -> (boolean?, string?),
     jobfind: @checked (name: string) -> (number?, string?),
     executable: @checked (name: string) -> (number),
+    has: @checked (what: string) -> (number),
     winsaveview: @checked () -> (any, string?),
     winrestview: @checked (view: any) -> (boolean?, string?),
   },
@@ -80,6 +82,7 @@ declare maki: {
     abspath: @checked (path: string) -> (string),
     parents: @checked (path: string) -> (any),
     root: @checked (source: string, marker: any) -> (string?, string?),
+    git_branch: @checked (path: string) -> (string?),
     relpath: @checked (base: string, target: string) -> (string),
     ext: @checked (path: string) -> (string?),
     dir: @checked (path: string, opts: any) -> (any, string?),
@@ -114,6 +117,9 @@ declare maki: {
     info: @checked (msg: string) -> (),
     warn: @checked (msg: string) -> (),
     error: @checked (msg: string) -> (),
+  },
+  mcp: {
+    register_resource: @checked (spec: any) -> (),
   },
   model: {
     get: @checked () -> (any, string?),

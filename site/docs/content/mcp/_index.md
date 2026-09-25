@@ -77,7 +77,7 @@ Maki checks certificates against the operating system's trust store, so a CA tha
 | `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
 | `oauth` | table | | HTTP only: OAuth client (optional `client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`, optional `callback_scheme`) |
 | `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
-| `timeout` | u64 | 30000 | Milliseconds (1-300000) |
+| `timeout` | u64 | 30000 | Milliseconds (1-300000). The reserved `executor` server has no request timeout: its tools bound their own runs |
 | `enabled` | bool | true | |
 | `always_load` | bool | false | Skip tool search, load all tools upfront |
 
@@ -88,6 +88,8 @@ server looks like this:
 [mcp.myservice]
 path = "/run/myservice/mcp.sock"
 ```
+
+The server name `executor` is reserved for the [brain/executor split](/docs/split-mode/).
 
 One option lives at the top level of `mcp.toml`, outside any server:
 

@@ -1,0 +1,28 @@
+# Executor image for split mode: maki serve plus the dev toolchain the agent
+# may run. Extend the apt list with your own (compilers, test runners, LSPs).
+#
+#   podman build -f contrib/split/Containerfile.executor -t localhost/maki-executor .
+#
+# MAKI_VERSION and MAKI_SHA256 move together.
+FROM debian:trixie-slim AS fetch
+
+ARG MAKI_VERSION=v0.5.6
+ARG MAKI_SHA256=4864b79237c70b8292f120c1b17a52cdaca7a7af3db0baed2c2da3dae41d7dcd
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl findutils \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /fetch
+RUN curl -fsSLO "https://github.com/tontinton/maki/releases/download/${MAKI_VERSION}/maki-${MAKI_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+ && echo "${MAKI_SHA256}  maki-${MAKI_VERSION}-x86_64-unknown-linux-musl.tar.gz" | sha256sum -c - \
+ && mkdir maki-out && tar -xzf "maki-${MAKI_VERSION}-x86_64-unknown-linux-musl.tar.gz" -C maki-out \
+ && install -D "$(find maki-out -type f -name maki | head -1)" /fetch/bin/maki
+
+FROM debian:trixie-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=fetch /fetch/bin/maki /usr/local/bin/maki
+ENV HOME=/home/executor
+ENTRYPOINT ["maki", "serve", "--socket", "/run/maki-split/executor.sock"]

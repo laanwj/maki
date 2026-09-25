@@ -475,6 +475,21 @@ async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<Stri
     .await
 }
 
+/// Return the checked-out branch of the git repository containing {path},
+/// or the short HEAD hash when detached. Relative paths resolve from the
+/// current working directory. Worktree `.git` files are followed.
+///
+/// @param path string Absolute or relative path inside the repository.
+/// @return (string?) Branch name or short hash, or nil outside a repository.
+/// @example
+/// local branch = maki.fs.git_branch("src") -- "main"
+#[lua_fn(guard = FsRead)]
+fn git_branch(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
+    Ok(maki_agent::git::detect_branch(
+        &make_absolute(&path).map_err(mlua::Error::runtime)?,
+    ))
+}
+
 /// Compute a relative path from {base} to {target}.
 ///
 /// @param base string Base directory path.
@@ -1226,7 +1241,7 @@ lua_table! {
     /// ```
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), metadata(perms), dirname, basename,
-        joinpath, normalize, abspath, parents, root(perms), relpath, ext,
+        joinpath, normalize, abspath, parents, root(perms), git_branch(perms), relpath, ext,
         dir(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]

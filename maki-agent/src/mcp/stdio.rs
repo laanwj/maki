@@ -29,7 +29,7 @@ impl StdioTransport {
         program: &str,
         args: &[String],
         environment: &HashMap<String, String>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Self, McpError> {
         let mut std_cmd = std::process::Command::new(program);
         strip_provider_keys(&mut std_cmd)
@@ -130,6 +130,10 @@ impl McpTransport for StdioTransport {
     fn child_pids(&self) -> Vec<u32> {
         vec![self._child.id()]
     }
+
+    fn notification_hub(&self) -> Option<super::line::NotificationHub> {
+        Some(self.io.hub())
+    }
 }
 
 #[cfg(test)]
@@ -149,7 +153,7 @@ mod tests {
         pending.lock().await.insert(1, tx);
 
         let mut reader = BufReader::new(Cursor::new(input.as_bytes().to_vec()));
-        let _ = reader_loop(&name, &mut reader, &pending).await;
+        let _ = reader_loop(&name, &mut reader, &pending, &Default::default()).await;
 
         rx.try_recv().unwrap_or(Err(McpError::ServerDied {
             server: "no response received".into(),

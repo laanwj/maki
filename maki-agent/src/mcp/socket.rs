@@ -105,7 +105,9 @@ mod tests {
                     stream.flush().await.unwrap();
                 })
             });
-            let transport = SocketTransport::connect("test", &path, TIMEOUT).await.unwrap();
+            let transport = SocketTransport::connect("test", &path, TIMEOUT)
+                .await
+                .unwrap();
             let result = transport
                 .send_request("tools/list", None)
                 .await
@@ -128,7 +130,9 @@ mod tests {
                         .unwrap();
                 })
             });
-            let transport = SocketTransport::connect("test", &path, TIMEOUT).await.unwrap();
+            let transport = SocketTransport::connect("test", &path, TIMEOUT)
+                .await
+                .unwrap();
             transport
                 .send_notification("notifications/initialized", None)
                 .await
@@ -150,10 +154,9 @@ mod tests {
                     std::future::pending::<()>().await;
                 })
             });
-            let transport =
-                SocketTransport::connect("test", &path, Duration::from_millis(100))
-                    .await
-                    .unwrap();
+            let transport = SocketTransport::connect("test", &path, Duration::from_millis(100))
+                .await
+                .unwrap();
             let result = transport.send_request("tools/list", None).await;
             assert!(matches!(result, Err(McpError::Timeout { .. })));
         });
@@ -169,7 +172,9 @@ mod tests {
                     let _ = reader.read_line(&mut line).await;
                 })
             });
-            let transport = SocketTransport::connect("test", &path, TIMEOUT).await.unwrap();
+            let transport = SocketTransport::connect("test", &path, TIMEOUT)
+                .await
+                .unwrap();
             let result = transport.send_request("tools/list", None).await;
             assert!(matches!(result, Err(McpError::ServerDied { .. })));
         });

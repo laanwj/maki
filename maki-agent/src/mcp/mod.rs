@@ -21,6 +21,7 @@ pub mod http;
 pub mod line;
 pub mod oauth;
 pub mod protocol;
+pub mod server;
 pub mod socket;
 pub mod stdio;
 pub mod transport;
@@ -206,6 +207,7 @@ struct ToolIndex {
     tools: HashMap<Arc<str>, ToolRef>,
     prompts: HashMap<String, PromptRef>,
     descriptors: Arc<[ToolDescriptor]>,
+    transports: HashMap<Arc<str>, Arc<dyn McpTransport>>,
 }
 
 /// One published MCP tool. Wire name and search text are derived from
@@ -579,6 +581,33 @@ impl McpHandle {
             (p.raw_name.clone(), Arc::clone(&p.transport))
         };
         transport::get_prompt(transport.as_ref(), &raw_name, arguments).await
+    }
+
+    fn server_transport(&self, server: &str) -> Result<Arc<dyn McpTransport>, McpError> {
+        let idx = self.index.load();
+        idx.transports
+            .get(server)
+            .cloned()
+            .ok_or_else(|| McpError::UnknownServer {
+                name: server.into(),
+            })
+    }
+
+    pub async fn list_resources(
+        &self,
+        server: &str,
+    ) -> Result<Vec<protocol::ResourceInfo>, McpError> {
+        let transport = self.server_transport(server)?;
+        transport::list_resources(transport.as_ref()).await
+    }
+
+    pub async fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<Vec<protocol::ResourceContent>, McpError> {
+        let transport = self.server_transport(server)?;
+        transport::read_resource(transport.as_ref(), uri).await
     }
 
     pub async fn shutdown(&self) {
@@ -1035,6 +1064,7 @@ fn apply_start_result(
 fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSwap<McpSnapshot>) {
     let mut tools = HashMap::new();
     let mut prompts = HashMap::new();
+    let mut transports = HashMap::new();
     let mut descriptors: Vec<ToolDescriptor> = Vec::new();
     let mut server_infos = Vec::with_capacity(inner.entries.len());
     let mut prompt_infos = Vec::new();
@@ -1054,6 +1084,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         if let Some(ref transport) = entry.transport
             && entry.status != McpServerStatus::Disabled
         {
+            transports.insert(Arc::from(entry.name.as_str()), Arc::clone(transport));
             let always_load = entry.config.as_ref().is_some_and(|c| c.always_load);
             for t in &entry.tools {
                 tools.insert(
@@ -1103,6 +1134,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
     index.store(Arc::new(ToolIndex {
         tools,
         prompts,
+        transports,
         descriptors: descriptors.into(),
     }));
     snapshot.store(Arc::new(McpSnapshot {
@@ -1327,6 +1359,131 @@ mod tests {
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
     const MISSING_CA_FILE: &str = "/nonexistent/ca.pem";
+
+    struct ResourceStub {
+        list_response: Option<Value>,
+    }
+
+    impl McpTransport for ResourceStub {
+        fn send_request<'a>(
+            &'a self,
+            method: &'a str,
+            params: Option<Value>,
+        ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
+            Box::pin(async move {
+                match method {
+                    "resources/list" => {
+                        self.list_response
+                            .clone()
+                            .ok_or_else(|| McpError::RpcError {
+                                server: "stub".into(),
+                                code: -32601,
+                                message: "no such method: resources/list".into(),
+                            })
+                    }
+                    "resources/read" => Ok(json!({
+                        "contents": [{
+                            "uri": params.as_ref().and_then(|p| p["uri"].as_str()),
+                            "text": "fn main() {}\n",
+                        }]
+                    })),
+                    _ => Err(McpError::RpcError {
+                        server: "stub".into(),
+                        code: -32601,
+                        message: format!("no such method: {method}"),
+                    }),
+                }
+            })
+        }
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> transport::BoxFuture<'a, Result<(), McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown<'a>(&'a self) -> transport::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn server_name(&self) -> &Arc<str> {
+            static NAME: OnceLock<Arc<str>> = OnceLock::new();
+            NAME.get_or_init(|| Arc::from("stub"))
+        }
+        fn transport_kind(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    fn resource_handle(list_response: Option<Value>) -> McpHandle {
+        let entry = ServerEntry {
+            name: "stub".into(),
+            config: None,
+            transport_kind: "stub",
+            origin: PathBuf::new(),
+            status: McpServerStatus::Running,
+            transport: Some(Arc::new(ResourceStub { list_response })),
+
+            tools: Vec::new(),
+            prompts: Vec::new(),
+        };
+        let inner = McpManagerInner {
+            entries: vec![entry],
+            generation: 0,
+        };
+        let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
+        let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+        publish(&inner, &index, &snapshot);
+        McpHandle {
+            cmd_tx: flume::unbounded().0,
+            index,
+            snapshot,
+            defer_tools: 0,
+            ready_rx: flume::bounded(0).1,
+        }
+    }
+
+    #[test]
+    fn list_resources_returns_entries() {
+        smol::block_on(async {
+            let handle = resource_handle(Some(json!({
+                "resources": [{"uri": "file:///ws/main.rs", "name": "main.rs"}]
+            })));
+            let resources = handle.list_resources("stub").await.unwrap();
+            assert_eq!(resources.len(), 1);
+            assert_eq!(resources[0].uri, "file:///ws/main.rs");
+        });
+    }
+
+    #[test]
+    fn read_resource_returns_contents() {
+        smol::block_on(async {
+            let handle = resource_handle(Some(json!({"resources": []})));
+            let contents = handle
+                .read_resource("stub", "file:///ws/main.rs")
+                .await
+                .unwrap();
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].text.as_deref(), Some("fn main() {}\n"));
+        });
+    }
+
+    #[test]
+    fn resources_unknown_server_errors() {
+        smol::block_on(async {
+            let handle = resource_handle(Some(json!({"resources": []})));
+            let result = handle.list_resources("nope").await;
+            assert!(matches!(result, Err(McpError::UnknownServer { .. })));
+        });
+    }
+
+    #[test]
+    fn list_resources_method_not_found_yields_empty() {
+        smol::block_on(async {
+            let handle = resource_handle(None);
+            let resources = handle.list_resources("stub").await.unwrap();
+            assert!(resources.is_empty());
+        });
+    }
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {

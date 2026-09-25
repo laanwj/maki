@@ -65,7 +65,16 @@ pub fn initialize_params() -> Value {
     })
 }
 
+/// A message received by the server end: requests carry both id and method,
+/// notifications only a method, anything else is junk to ignore.
 #[derive(Deserialize)]
+pub struct IncomingMessage {
+    pub id: Option<u64>,
+    pub method: Option<String>,
+    pub params: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ToolInfo {
     pub name: String,
     #[serde(default)]
@@ -79,13 +88,13 @@ pub struct ToolsListResult {
     pub tools: Vec<ToolInfo>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CallToolContent {
     #[serde(default)]
     pub text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<CallToolContent>,
     #[serde(default, rename = "isError")]
@@ -149,6 +158,36 @@ pub struct PromptMessage {
 #[derive(Deserialize)]
 pub struct GetPromptResult {
     pub messages: Vec<PromptMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ResourceInfo {
+    pub uri: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ResourcesListResult {
+    pub resources: Vec<ResourceInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ResourceContent {
+    pub uri: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ResourcesReadResult {
+    pub contents: Vec<ResourceContent>,
 }
 
 #[cfg(test)]

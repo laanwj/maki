@@ -7,7 +7,7 @@ group = "Reference"
 
 # MCP (Model Context Protocol)
 
-Maki connects to external tool servers over MCP. Both **stdio** and **HTTP** transports are supported.
+Maki connects to external tool servers over MCP. **stdio**, **HTTP**, and **unix socket** transports are supported.
 
 ## Configuration
 
@@ -81,7 +81,13 @@ Maki checks certificates against the operating system's trust store, so a CA tha
 | `enabled` | bool | true | |
 | `always_load` | bool | false | Skip tool search, load all tools upfront |
 
-Set `command` for stdio, `url` for HTTP. Pick one.
+Set `command` for stdio, `url` for HTTP, `path` for a unix socket. Pick one. A socket
+server looks like this:
+
+```toml
+[mcp.myservice]
+path = "/run/myservice/mcp.sock"
+```
 
 One option lives at the top level of `mcp.toml`, outside any server:
 

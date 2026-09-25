@@ -138,8 +138,11 @@ semver = "1"
 toml = "1.1"
 toml_edit = "0.25"
 smol = "2"
+async-net = "2"
 arc-swap = "1"
 bitflags = "2"
+
+
 event-listener = "5"
 futures-lite = "2"
 futures = "0.3"

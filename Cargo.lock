@@ -3216,6 +3216,7 @@ name = "maki-agent"
 version = "0.6.5"
 dependencies = [
  "arc-swap",
+ "async-net",
  "base64 0.23.1",
  "bitflags 2.13.2",
  "event-listener",

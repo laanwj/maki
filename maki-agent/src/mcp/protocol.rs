@@ -151,6 +151,36 @@ pub struct GetPromptResult {
     pub messages: Vec<PromptMessage>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct ResourceInfo {
+    pub uri: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ResourcesListResult {
+    pub resources: Vec<ResourceInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ResourceContent {
+    pub uri: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ResourcesReadResult {
+    pub contents: Vec<ResourceContent>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

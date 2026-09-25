@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use super::error::McpError;
 use super::protocol::{
-    CallToolResult, GetPromptResult, PromptInfo, PromptsListResult, ToolInfo, ToolsListResult,
-    initialize_params,
+    CallToolResult, GetPromptResult, PromptInfo, PromptsListResult, ResourceContent, ResourceInfo,
+    ResourcesListResult, ResourcesReadResult, ToolInfo, ToolsListResult, initialize_params,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -45,6 +45,7 @@ fn invalid_response(name: &Arc<str>, e: impl std::fmt::Display) -> McpError {
 pub struct ServerCapabilities {
     pub tools: bool,
     pub prompts: bool,
+    pub resources: bool,
 }
 
 impl ServerCapabilities {
@@ -52,6 +53,7 @@ impl ServerCapabilities {
         Self {
             tools: result["capabilities"]["tools"].is_object(),
             prompts: result["capabilities"]["prompts"].is_object(),
+            resources: result["capabilities"]["resources"].is_object(),
         }
     }
 }
@@ -99,6 +101,32 @@ pub async fn get_prompt(
     Ok(parsed.messages)
 }
 
+pub async fn list_resources(transport: &dyn McpTransport) -> Result<Vec<ResourceInfo>, McpError> {
+    let result = transport.send_request("resources/list", None).await;
+    match result {
+        Ok(val) => {
+            let list: ResourcesListResult = serde_json::from_value(val)
+                .map_err(|e| invalid_response(transport.server_name(), e))?;
+            Ok(list.resources)
+        }
+        Err(McpError::RpcError { code, .. }) if code == METHOD_NOT_FOUND => Ok(vec![]),
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn read_resource(
+    transport: &dyn McpTransport,
+    uri: &str,
+) -> Result<Vec<ResourceContent>, McpError> {
+    let params = serde_json::json!({ "uri": uri });
+    let result = transport
+        .send_request("resources/read", Some(params))
+        .await?;
+    let parsed: ResourcesReadResult =
+        serde_json::from_value(result).map_err(|e| invalid_response(transport.server_name(), e))?;
+    Ok(parsed.contents)
+}
+
 pub async fn call_tool(
     transport: &dyn McpTransport,
     tool_name: &str,
@@ -139,12 +167,16 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
-    #[test_case(json!({"capabilities": {"tools": {}, "prompts": {}}}), true, true ; "both")]
-    #[test_case(json!({"capabilities": {"tools": {"listChanged": false}}}), true, false ; "tools_only")]
-    #[test_case(json!({"capabilities": {"prompts": {}}}), false, true ; "prompts_only")]
-    #[test_case(json!({}), false, false ; "no_capabilities")]
-    fn parses_capabilities(result: Value, tools: bool, prompts: bool) {
+    #[test_case(json!({"capabilities": {"tools": {}, "prompts": {}, "resources": {}}}), true, true, true ; "all")]
+    #[test_case(json!({"capabilities": {"tools": {"listChanged": false}}}), true, false, false ; "tools_only")]
+    #[test_case(json!({"capabilities": {"prompts": {}}}), false, true, false ; "prompts_only")]
+    #[test_case(json!({"capabilities": {"resources": {"subscribe": true}}}), false, false, true ; "resources_only")]
+    #[test_case(json!({}), false, false, false ; "no_capabilities")]
+    fn parses_capabilities(result: Value, tools: bool, prompts: bool, resources: bool) {
         let caps = ServerCapabilities::parse(&result);
-        assert_eq!((caps.tools, caps.prompts), (tools, prompts));
+        assert_eq!(
+            (caps.tools, caps.prompts, caps.resources),
+            (tools, prompts, resources)
+        );
     }
 }

@@ -65,7 +65,16 @@ pub fn initialize_params() -> Value {
     })
 }
 
+/// A message received by the server end: requests carry both id and method,
+/// notifications only a method, anything else is junk to ignore.
 #[derive(Deserialize)]
+pub struct IncomingMessage {
+    pub id: Option<u64>,
+    pub method: Option<String>,
+    pub params: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ToolInfo {
     pub name: String,
     #[serde(default)]
@@ -79,13 +88,25 @@ pub struct ToolsListResult {
     pub tools: Vec<ToolInfo>,
 }
 
-#[derive(Deserialize)]
-pub struct CallToolContent {
-    #[serde(default)]
-    pub text: String,
+/// MCP content blocks use a tagged union on the wire.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CallToolContent {
+    Text {
+        text: String,
+    },
+    /// Tolerate block types maki does not model without failing the call.
+    #[serde(other)]
+    Unknown,
 }
 
-#[derive(Deserialize)]
+impl CallToolContent {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<CallToolContent>,
     #[serde(default, rename = "isError")]
@@ -96,7 +117,10 @@ impl CallToolResult {
     pub fn joined_text(&self) -> String {
         self.content
             .iter()
-            .map(|c| c.text.as_str())
+            .filter_map(|c| match c {
+                CallToolContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -206,7 +230,7 @@ mod tests {
 
     #[test]
     fn call_tool_result_honours_is_error_rename() {
-        let raw = json!({"content": [{"text": "hello"}], "isError": true});
+        let raw = json!({"content": [{"type": "text", "text": "hello"}], "isError": true});
         let result: CallToolResult = serde_json::from_value(raw).unwrap();
         assert!(result.is_error);
         assert_eq!(result.joined_text(), "hello");

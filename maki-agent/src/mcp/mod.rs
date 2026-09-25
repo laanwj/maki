@@ -21,6 +21,7 @@ pub mod http;
 pub mod line;
 pub mod oauth;
 pub mod protocol;
+pub mod server;
 pub mod socket;
 pub mod stdio;
 pub mod transport;

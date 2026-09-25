@@ -57,4 +57,31 @@ case("split_lines", function()
   end
 end)
 
+-- read_view: the output parsing the brain-side view rebuilds bodies from
+
+case("view_parse_output_reads_numbered_lines_and_truncation", function()
+  local read_view = require("read_view")
+  local lines, start_line, total =
+    read_view.parse_output(" 12: alpha\n13: beta\n\n...\n\nTruncated lines: 12-30. Use offset=12 to read further.")
+  eq(#lines, 2)
+  eq(lines[1], "alpha")
+  eq(lines[2], "beta")
+  eq(start_line, 12)
+  eq(total, 30)
+end)
+
+case("view_parse_output_unnumbered_output_yields_nothing", function()
+  local read_view = require("read_view")
+  local lines, start_line, total = read_view.parse_output("just text")
+  eq(#lines, 0)
+  eq(start_line, nil)
+  eq(total, nil)
+end)
+
+case("view_summary_mirrors_the_header_range", function()
+  local read_view = require("read_view")
+  eq(read_view.summary({ path = "x.rs", offset = 1, limit = 10 }), "x.rs:1-10")
+  eq(read_view.summary({ path = "x.rs", offset = 5, limit = 0 }), "x.rs:5")
+end)
+
 th.report()

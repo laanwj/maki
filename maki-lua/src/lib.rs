@@ -10,6 +10,7 @@ pub mod language;
 mod loader;
 mod pack;
 pub(crate) mod plugin_permissions;
+pub mod role;
 mod runtime;
 pub mod session_snapshot;
 
@@ -31,6 +32,7 @@ pub use key::{Key, RESERVED_KEYS, is_reserved};
 pub use key_lint::KEY_WARNING;
 pub use loader::{
     EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
+    check_plugin_sources,
 };
 pub use maki_agent::SessionEndReason;
 pub use pack::{
@@ -40,6 +42,7 @@ pub use pack::{
     lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
+pub use role::{HostRole, PluginRole};
 pub use runtime::{
     KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
     RestoreItem, RestoreReason, WARM_TOOL_CAP,

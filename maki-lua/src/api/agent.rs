@@ -106,6 +106,7 @@ async fn relay_session_events(
             }
             AgentEvent::Error { .. }
             | AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolProgress { .. }
             | AgentEvent::ToolPending { .. }
             | AgentEvent::SubagentHistory { .. } => continue,
             _ => {}

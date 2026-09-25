@@ -17,7 +17,7 @@ pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
-    ToolRegistry, ToolSource,
+    ToolRegistry, ToolSource, ViewDone, ViewHook, ViewStart,
 };
 
 use std::collections::HashMap;

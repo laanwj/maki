@@ -33,6 +33,11 @@ pub trait McpTransport: Send + Sync {
     fn child_pids(&self) -> Vec<u32> {
         Vec::new()
     }
+    /// Line-based transports route server notifications (progress, log
+    /// messages) to watchers; anything else gets nothing.
+    fn notification_hub(&self) -> Option<super::line::NotificationHub> {
+        None
+    }
 }
 
 fn invalid_response(name: &Arc<str>, e: impl std::fmt::Display) -> McpError {
@@ -59,12 +64,39 @@ impl ServerCapabilities {
 }
 
 pub async fn initialize(transport: &dyn McpTransport) -> Result<ServerCapabilities, McpError> {
-    let params = initialize_params();
+    initialize_with(transport, None).await
+}
+
+/// `initialize` with extra params merged in — the brain's executor config
+/// push rides the executor's handshake this way.
+pub async fn initialize_with(
+    transport: &dyn McpTransport,
+    extra: Option<Value>,
+) -> Result<ServerCapabilities, McpError> {
+    Ok(ServerCapabilities::parse(
+        &initialize_full(transport, extra).await?,
+    ))
+}
+
+/// The raw initialize result: extras like the executor's workspace report
+/// live outside the capabilities.
+pub async fn initialize_full(
+    transport: &dyn McpTransport,
+    extra: Option<Value>,
+) -> Result<Value, McpError> {
+    let mut params = initialize_params();
+    if let Some(extra) = extra
+        && let (Some(extra), Some(map)) = (extra.as_object(), params.as_object_mut())
+    {
+        for (key, value) in extra {
+            map.insert(key.clone(), value.clone());
+        }
+    }
     let result = transport.send_request("initialize", Some(params)).await?;
     transport
         .send_notification("notifications/initialized", None)
         .await?;
-    Ok(ServerCapabilities::parse(&result))
+    Ok(result)
 }
 
 pub async fn list_tools(transport: &dyn McpTransport) -> Result<Vec<ToolInfo>, McpError> {
@@ -127,17 +159,71 @@ pub async fn read_resource(
     Ok(parsed.contents)
 }
 
+/// What a tools/call returned: the text every tool yields, plus the image
+/// an image tool's answer carries (the model reads it as vision input).
+#[derive(Debug)]
+pub struct McpCallOutput {
+    pub text: String,
+    pub image: Option<maki_providers::ImageSource>,
+}
+
 pub async fn call_tool(
     transport: &dyn McpTransport,
     tool_name: &str,
     args: &Value,
-) -> Result<String, McpError> {
-    let server = &**transport.server_name();
-    let start = Instant::now();
+) -> Result<McpCallOutput, McpError> {
     let params = serde_json::json!({
         "name": tool_name,
         "arguments": args,
     });
+    call_tool_inner(transport, params).await
+}
+
+/// The chat (and subagent task) a tools/call serves; the executor keys
+/// per-session tool state on it. Both `None` for sessionless callers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CallRoute<'a> {
+    pub session_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+}
+
+/// tools/call with a progressToken: progress notifications for this call
+/// stream out of the notification hub as ToolOutput events for `tool_id`.
+pub async fn call_tool_streaming(
+    transport: &dyn McpTransport,
+    tool_name: &str,
+    args: &Value,
+    tool_id: &str,
+    route: CallRoute<'_>,
+    events: &crate::types::EventSender,
+    payloads: Option<flume::Sender<Value>>,
+) -> Result<McpCallOutput, McpError> {
+    let Some(hub) = transport.notification_hub() else {
+        return call_tool(transport, tool_name, args).await;
+    };
+    let _guard = hub.watch_progress(tool_id, Arc::from(tool_id), events.clone(), payloads);
+    let mut meta = serde_json::json!({ "progressToken": tool_id });
+    if let Some(sid) = route.session_id {
+        meta["maki_session_id"] = Value::from(sid);
+    }
+    if let Some(tid) = route.task_id {
+        meta["maki_task_id"] = Value::from(tid);
+    }
+    let params = serde_json::json!({
+        "name": tool_name,
+        "arguments": args,
+        "_meta": meta,
+    });
+    call_tool_inner(transport, params).await
+}
+
+async fn call_tool_inner(
+    transport: &dyn McpTransport,
+    params: Value,
+) -> Result<McpCallOutput, McpError> {
+    let server = &**transport.server_name();
+    let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
+    let start = Instant::now();
     let result = transport.send_request("tools/call", Some(params)).await?;
     let call_result: CallToolResult =
         serde_json::from_value(result).map_err(|e| invalid_response(transport.server_name(), e))?;
@@ -156,9 +242,13 @@ pub async fn call_tool(
         server,
         tool = tool_name,
         duration_ms = start.elapsed().as_millis() as u64,
+        has_image = call_result.image().is_some(),
         "MCP tools/call response"
     );
-    Ok(text)
+    Ok(McpCallOutput {
+        text,
+        image: call_result.image(),
+    })
 }
 
 #[cfg(test)]

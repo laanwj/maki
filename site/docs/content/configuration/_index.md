@@ -233,7 +233,7 @@ Each plugin checks its own options at startup. A typo, a wrong type, or an unkno
 
 The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
 
-This table is for bundled plugins only. Your own plugins go in `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).
+This table is for bundled plugins only. Your own plugins go in `~/.config/maki/autoload/`, see [Plugins](/docs/plugins/).
 
 ```lua
 maki.setup({

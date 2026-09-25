@@ -559,6 +559,64 @@ maki.api.register_command({
 
 ---
 
+### `maki.api.register_tool_view()` {#maki-api-register_tool_view}
+
+```lua
+maki.api.register_tool_view({spec})
+```
+
+Register the view for a tool this host never runs: an MCP tool, e.g. the
+executor's tools in the brain/executor split. The view is the tool's whole
+presentation, painted with the full `maki.ui` surface from the brain's own
+Lua host; the executor only executes and emits progress.
+
+Callbacks (at least one required):
+  start(input, ctx)                  Paint the preview, exactly like a
+    tool's own `start` (`ctx:live_buf`, `maki.ui`, config reads). May
+    return a per-call state value, which `progress` and `done` get back,
+    and optionally a header summary as the second return.
+  progress(state, payload)           One call per payload the tool emits
+    with `ctx:progress(...)`; the payload's JSON shape is the tool's own
+    contract with its view.
+  done(state, input, output, is_error)   Paint the final body.
+
+Executor-role hosts reject this: views are UI-side. A native tool with its
+own `header`/`start` keeps it; the view serves tools that have neither.
+One view per tool name; a later registration replaces an earlier one.
+
+Session restore replays `start(input)` then `done(state, input, output)` —
+no live executor needed, and the restored row keeps its click handlers.
+`ctx:live_buf` in `start` publishes the body to restore from; a view
+without `start` leaves restores to generic rendering.
+
+**Parameters:**
+
+- `{spec}` (`table`) View specification:
+  - `tool` (`string`) Required. Qualified tool name (`server.tool`); the
+    executor's own tools keep their bare names.
+  - `start` (`function`) Optional. `function(input, ctx) -> state[, summary]`.
+  - `progress` (`function`) Optional. `function(state, payload)`.
+  - `done` (`function`) Optional. `function(state, input, output, is_error)`.
+
+**Example:**
+
+```lua
+maki.api.register_tool_view({
+  tool = "python",
+  start = function(input, ctx)
+    local buf = maki.ui.buf()
+    for _, line in ipairs(maki.ui.highlight(input.code or "", "py") or {}) do
+      buf:line(line)
+    end
+    ctx:live_buf(buf)
+    return { buf = buf }, "running python"
+  end,
+  done = function(state) state.buf:line({ { "done", "dim" } }) end,
+})
+```
+
+---
+
 ### `maki.api.register_prompt_hint()` {#maki-api-register_prompt_hint}
 
 ```lua
@@ -2286,6 +2344,34 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 ```lua
 if maki.fn.executable("rg") == 1 then
   -- use ripgrep
+end
+```
+
+---
+
+### `maki.fn.has()` {#maki-fn-has}
+
+```lua
+maki.fn.has({what})
+```
+
+Report which side of the brain/executor split this host is, for plugins
+that carry both kinds of code and pick at load time. "split" answers
+whether any split applies, so a plugin can load in single-process mode
+and on the executor but skip a split brain. Single-process maki answers
+"brain": there is no executor to distinguish.
+
+**Parameters:**
+
+- `{what}` (`string`) `"executor"`, `"brain"`, or `"split"`.
+
+**Returns:** (`integer`) `1` when the host runs in that role, `0` otherwise.
+
+**Example:**
+
+```lua
+if maki.fn.has("split") == 0 then
+  -- register a tool; only possible without a split
 end
 ```
 
@@ -6910,6 +6996,7 @@ return M
 -- shows a directory the same way. Listing also loads the directory's
 -- instruction files onto the call.
 function M.list(path, ctx)
+function M.opts(ctx)
 function M.view(text, ctx)
 ```
 
@@ -7221,6 +7308,10 @@ function ToolView.restore_lines(lines, opts)
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
+
+-- Same render into an existing buf: a brain-side view's `done` gets no ctx to
+-- publish a buf with, so it fills the one its `start` published.
+function ToolView.populate(buf, text, opts)
 
 -- Same, for tools whose live output goes through markdown (`format =
 -- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do

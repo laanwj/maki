@@ -1,5 +1,7 @@
 mod acp;
 mod migrate;
+#[cfg(unix)]
+mod serve;
 mod session;
 mod subcmd;
 mod tui;
@@ -246,6 +248,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::Acp { model, yolo }) => {
             acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
+        }
+        #[cfg(unix)]
+        Some(Command::Serve { socket, workspace }) => serve::run(socket, workspace)?,
+        #[cfg(not(unix))]
+        Some(Command::Serve { .. }) => {
+            return Err(color_eyre::eyre::eyre!(
+                "maki serve is only supported on unix"
+            ));
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,

@@ -1,3 +1,4 @@
+local write_view = require("write_view")
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 
@@ -6,21 +7,8 @@ local DESCRIPTION = [[Write content to a file, replacing existing content.
 - Creates parent directories if needed.
 - Always read the file first before writing.]]
 
-local function write_view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.write) or 10, keep = "head" }
-end
-
-local function build_view(content, path, ctx)
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, write_view_opts(ctx))
-  view:set_highlight(content, path:match("%.([^%.]+)$") or "")
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
-end
+local write_view_opts = write_view.view_opts
+local build_view = write_view.build_view
 
 maki.api.register_tool({
   name = "write",
@@ -54,7 +42,7 @@ maki.api.register_tool({
 
   header = function(input)
     local buf = maki.ui.buf()
-    buf:line({ { shorten_path(input.path or ""), "path" } })
+    buf:line({ { write_view.summary(input), "path" } })
     return buf
   end,
 

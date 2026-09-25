@@ -288,6 +288,7 @@ pub struct PluginHost {
     inner: LuaThread,
     plugin_rules: Arc<PluginRuleStore>,
     registry: Arc<ToolRegistry>,
+    role: crate::role::HostRole,
 }
 
 impl Drop for PluginHost {
@@ -310,6 +311,23 @@ impl Drop for PluginHost {
     }
 }
 
+/// Compile-checks every pushed plugin source the way the executor's Luau VM
+/// will. A syntax error is a fatal startup error naming the file, the same as
+/// a broken init.lua.
+pub fn check_plugin_sources(push: &maki_agent::mcp::push::ExecutorPush) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for plugin in &push.plugin_sources {
+        if let Err(e) = mlua::Compiler::new().compile(&plugin.source) {
+            failures.push(format!("{}: {e}", plugin.name));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
 impl PluginHost {
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
         Self::with_jit(registry, true)
@@ -319,17 +337,33 @@ impl PluginHost {
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
     pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
+        Self::with_role(registry, crate::role::HostRole::SingleProcess, jit)
+    }
+
+    /// A host for the executor half of the brain/executor split: TUI-facing
+    /// APIs are gated off, and user plugins must declare `role = "executor"`.
+    pub fn executor(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        Self::with_role(registry, crate::role::HostRole::Executor, true)
+    }
+
+    pub fn with_role(
+        registry: Arc<ToolRegistry>,
+        role: crate::role::HostRole,
+        jit: bool,
+    ) -> Result<Self, PluginError> {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
             *BUNDLED_DIRS,
             jit,
             Arc::clone(&plugin_rules),
+            role,
         )?;
         Ok(Self {
             inner: lua,
             plugin_rules,
             registry,
+            role,
         })
     }
 
@@ -407,6 +441,15 @@ impl PluginHost {
         }
 
         let mut merged: Option<RawConfig> = None;
+        let global_dirs: Vec<PathBuf> = global_dirs.into_iter().collect();
+
+        // The autoload dirs overlay like packages (every dir contributes),
+        // while init.lua stays first-wins.
+        for role in Self::role_dirs(self.role) {
+            for global_dir in &global_dirs {
+                self.load_autoload_dir(global_dir, *role, warnings)?;
+            }
+        }
 
         for global_dir in global_dirs {
             self.run_init_file(
@@ -424,6 +467,18 @@ impl PluginHost {
         }
 
         Ok(merged)
+    }
+
+    /// Package-visibility helper for the autoload dirs a host role loads.
+    fn role_dirs(role: crate::role::HostRole) -> &'static [crate::role::PluginRole] {
+        match role {
+            crate::role::HostRole::Brain => &[crate::role::PluginRole::Brain],
+            crate::role::HostRole::Executor => &[crate::role::PluginRole::Executor],
+            crate::role::HostRole::SingleProcess => &[
+                crate::role::PluginRole::Brain,
+                crate::role::PluginRole::Executor,
+            ],
+        }
     }
 
     fn run_init_file(
@@ -513,6 +568,35 @@ impl PluginHost {
             let Some(builtin) = config.names.iter().find(|n| n.as_str() == bundled.name) else {
                 continue;
             };
+            // A split host loads only its own role's builtins: the config
+            // lists every enabled one, and the sibling process runs the rest.
+            let other_role = match self.role {
+                crate::role::HostRole::Brain => !maki_config::is_brain_role_builtin(bundled.name),
+                crate::role::HostRole::Executor => maki_config::is_brain_role_builtin(bundled.name),
+                crate::role::HostRole::SingleProcess => false,
+            };
+            if other_role {
+                // The brain still loads an executor builtin's view.lua, so a
+                // split session's executor tools paint with their own
+                // display instead of the generic MCP row.
+                if self.role == crate::role::HostRole::Brain
+                    && let Some(view) = bundled
+                        .dir
+                        .get_file("view.lua")
+                        .and_then(|f| f.contents_utf8())
+                {
+                    let name: Arc<str> = Arc::from(builtin.as_str());
+                    self.send_load(
+                        Arc::clone(&name),
+                        vec![LoadChunk::bundled(name.as_ref(), view)],
+                        LoadContext {
+                            opts: Arc::default(),
+                            ..LoadContext::plain(None, bundled_permissions(bundled)?)
+                        },
+                    )?;
+                }
+                continue;
+            }
             let dir = &bundled.dir;
             let init = dir
                 .get_file("init.lua")
@@ -684,6 +768,68 @@ impl PluginHost {
             vec![LoadChunk::new(path.display().to_string(), source)],
             LoadContext::plain(plugin_dir, permissions),
         )
+    }
+
+    /// A plugin shipped by the brain over the executor handshake: a single
+    /// Lua source file with its capabilities in the leading comment block
+    /// (`---@permissions run, fs_read`). Declared permissions are granted;
+    /// the brain vetted them at write time.
+    pub fn load_pushed_plugin(&self, name: &str, source: &str) -> Result<(), PluginError> {
+        let annotations = maki_config::parse_plugin_annotations(source);
+        let permissions =
+            crate::plugin_permissions::permissions_from_annotations(name, &annotations)?;
+        self.send_load(
+            Arc::from(name),
+            vec![LoadChunk::new(name.to_owned(), source.to_owned())],
+            LoadContext::plain(None, permissions),
+        )
+    }
+
+    /// Loose user plugins auto-load from `autoload/<role>/` under each config
+    /// Loose user plugins auto-load from `autoload/<role>/` under each config
+    /// dir: the directory places them. `---@permissions` declares capabilities
+    /// in-file.
+    fn load_autoload_dir(
+        &self,
+        config_dir: &Path,
+        role: crate::role::PluginRole,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), PluginError> {
+        let dir = config_dir.join("autoload").join(role.as_str());
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                warnings.push(format!("{}: unreadable autoload dir: {e}", dir.display()));
+                return Ok(());
+            }
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("lua"))
+            .collect();
+        files.sort();
+        for path in files {
+            let source = fs::read_to_string(&path).map_err(|e| PluginError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+            let annotations = maki_config::parse_plugin_annotations(&source);
+            let name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let permissions =
+                crate::plugin_permissions::permissions_from_annotations(&name, &annotations)?;
+            self.send_load(
+                Arc::from(name.as_str()),
+                vec![LoadChunk::new(name.as_str(), &source)],
+                LoadContext::plain(Some(config_dir.to_path_buf()), permissions),
+            )?;
+        }
+        Ok(())
     }
 
     /// Packages declared by `maki.pack.add` in `init.lua`.
@@ -1378,6 +1524,411 @@ mod tests {
         assert!(reg.has("glob"));
     }
 
+    const EXECUTOR_GATE: &str = "not available in executor-role plugins";
+
+    #[test]
+    fn executor_host_rejects_tui_surface() {
+        let host = PluginHost::executor(Arc::new(ToolRegistry::new())).unwrap();
+        for (name, source) in [
+            (
+                "cmd",
+                r#"maki.api.register_command({ name = "x", handler = function() end })"#,
+            ),
+            ("keymap", r#"maki.keymap.set("n", "x", function() end)"#),
+            ("ui", r#"maki.ui.open_win()"#),
+        ] {
+            let err = host.load_source(name, source).unwrap_err();
+            assert!(
+                err.to_string().contains(EXECUTOR_GATE),
+                "{name}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn executor_host_registers_tools_and_reports_its_role() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::executor(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "t",
+            r#"
+            if maki.fn.has("executor") ~= 1 then error("has(executor) must be 1") end
+            if maki.fn.has("brain") ~= 0 then error("has(brain) must be 0") end
+            if maki.fn.has("split") ~= 1 then error("has(split) must be 1") end
+            maki.api.register_tool({
+                name = "ex_tool",
+                description = "d",
+                schema = { type = "object", properties = {} },
+                handler = function() return "ok" end,
+            })
+            "#,
+        )
+        .unwrap();
+        assert!(reg.has("ex_tool"));
+    }
+
+    #[test]
+    fn split_hosts_load_only_their_own_roles_builtins() {
+        let all = PluginsConfig::from_plugins(HashMap::new());
+
+        let brain_reg = Arc::new(ToolRegistry::new());
+        let mut brain =
+            PluginHost::with_role(Arc::clone(&brain_reg), crate::role::HostRole::Brain, true)
+                .unwrap();
+        with_builtin_load(|| brain.load_builtins(&all)).unwrap();
+        assert!(brain_reg.has("task"));
+        assert!(!brain_reg.has("read"));
+        assert!(
+            brain_reg.tool_view("write").is_some(),
+            "the brain loads the executor builtins' views"
+        );
+        for tool in [
+            "read",
+            "edit",
+            "multiedit",
+            "glob",
+            "grep",
+            "list",
+            "index",
+            "skill",
+            "view_image",
+        ] {
+            assert!(
+                brain_reg.tool_view(tool).is_some(),
+                "brain must carry the {tool} view"
+            );
+        }
+
+        let executor_reg = Arc::new(ToolRegistry::new());
+        let mut executor = PluginHost::executor(Arc::clone(&executor_reg)).unwrap();
+        with_builtin_load(|| executor.load_builtins(&all)).unwrap();
+        assert!(executor_reg.has("read"));
+        assert!(
+            executor_reg.tool_view("write").is_none(),
+            "the executor executes; it never paints"
+        );
+
+        // Single-process paints from the tools' own displays, so no views.
+        let single_reg = Arc::new(ToolRegistry::new());
+        let mut single = PluginHost::new(Arc::clone(&single_reg)).unwrap();
+        with_builtin_load(|| single.load_builtins(&all)).unwrap();
+        assert!(single_reg.has("write"));
+        assert!(single_reg.tool_view("write").is_none());
+        assert!(!executor_reg.has("task"));
+    }
+
+    #[test]
+    fn brain_host_runs_a_registered_views_lifecycle() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host =
+            PluginHost::with_role(Arc::clone(&reg), crate::role::HostRole::Brain, true).unwrap();
+        host.load_source(
+            "t",
+            r#"maki.api.register_tool_view({
+                tool = "python",
+                start = function(input, ctx)
+                    local buf = maki.ui.buf()
+                    buf:line("body line")
+                    buf:on("click", function() maki.notify("clicked") end)
+                    ctx:live_buf(buf)
+                    return { seen = "start:" .. (input.code or "?") }, "starting python"
+                end,
+                progress = function(state, payload)
+                    state.seen = state.seen .. "|progress:" .. payload
+                end,
+                done = function(state, input, output, is_error)
+                    maki.notify(state.seen .. "|done:" .. output .. (if is_error then "!" else ""))
+                end,
+            })"#,
+        )
+        .unwrap();
+        let view = reg.tool_view("python").expect("view registered");
+
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let event_tx = maki_agent::EventSender::new(tx, 0);
+            let ctx = maki_agent::tools::test_support::stub_ctx_with(
+                &maki_agent::AgentMode::Build,
+                Some(&event_tx),
+                None,
+            );
+            let summary = (view.start)(maki_agent::tools::ViewStart {
+                call_id: Arc::from("c1"),
+                tool: Arc::from("python"),
+                input: serde_json::json!({ "code": "print(1)" }),
+                ctx,
+            })
+            .await;
+            assert_eq!(summary.as_deref(), Some("starting python"));
+            (view.progress)(Arc::from("c1"), serde_json::json!("a line")).await;
+            // Clicks route to the view's buf while the call runs...
+            host.event_handle().request_click("c1".to_string(), 1);
+
+            (view.done)(maki_agent::tools::ViewDone {
+                call_id: Arc::from("c1"),
+                input: serde_json::json!({ "code": "print(1)" }),
+                output: "result text".into(),
+                is_error: false,
+            })
+            .await;
+            // ...and from the warm cache after it finished.
+            host.event_handle().request_click("c1".to_string(), 1);
+        });
+
+        let rx = host.ui_action_rx();
+        for expected in [
+            "clicked",
+            "start:print(1)|progress:a line|done:result text",
+            "clicked",
+        ] {
+            let crate::UiAction::Flash(message) =
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+            else {
+                panic!("expected a flash, got none");
+            };
+            assert_eq!(message, expected);
+        }
+    }
+
+    /// A restored row for a tool the brain never ran replays its view's
+    /// start+done, so the body comes back instead of generic text.
+    #[test]
+    fn brain_host_replays_a_view_on_restore() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host =
+            PluginHost::with_role(Arc::clone(&reg), crate::role::HostRole::Brain, true).unwrap();
+        host.load_source(
+            "t",
+            r#"maki.api.register_tool_view({
+                tool = "python",
+                start = function(input, ctx)
+                    local buf = maki.ui.buf()
+                    buf:line("preview " .. (input.code or "?"))
+                    ctx:live_buf(buf)
+                    return { buf = buf }, "starting python"
+                end,
+                done = function(state, input, output, is_error)
+                    state.buf:line("done " .. output)
+                end,
+            })"#,
+        )
+        .unwrap();
+
+        let (tx, rx) = flume::unbounded();
+        let handle = host.event_handle();
+        handle.request_restore(
+            crate::RestoreItem {
+                tool: Arc::from("python"),
+                tool_use_id: "r1".into(),
+                output: "result text".into(),
+                input: serde_json::json!({ "code": "print(1)" }),
+                is_error: false,
+                tool_output_lines: Default::default(),
+                theme_gen: None,
+                clicks: vec![],
+                state: None,
+                task_id: None,
+                session_id: None,
+                reason: crate::RestoreReason::default(),
+            },
+            maki_agent::EventSender::new(tx, 0),
+        );
+        handle.wait_restore_complete_for_test();
+
+        let snapshot = rx
+            .drain()
+            .filter_map(|env| match env.event {
+                maki_agent::AgentEvent::ToolSnapshot { id, snapshot, .. } => {
+                    assert_eq!(id, "r1");
+                    Some(snapshot)
+                }
+                _ => None,
+            })
+            .last()
+            .expect("a restored body snapshot");
+        let text: String = snapshot
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("preview print(1)"), "got: {text}");
+        assert!(text.contains("done result text"), "got: {text}");
+    }
+
+    /// The real builtin views replay too: a restored write row shows the
+    /// content preview, not generic output text.
+    #[test]
+    fn brain_host_replays_the_builtin_write_view() {
+        let all = PluginsConfig::from_plugins(HashMap::new());
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host =
+            PluginHost::with_role(Arc::clone(&reg), crate::role::HostRole::Brain, true).unwrap();
+        with_builtin_load(|| host.load_builtins(&all)).unwrap();
+
+        let (tx, rx) = flume::unbounded();
+        let handle = host.event_handle();
+        handle.request_restore(
+            crate::RestoreItem {
+                tool: Arc::from("write"),
+                tool_use_id: "r1".into(),
+                output: "wrote 12 bytes to /tmp/x.rs".into(),
+                input: serde_json::json!({ "path": "/tmp/x.rs", "content": "fn main() {}" }),
+                is_error: false,
+                tool_output_lines: Default::default(),
+                theme_gen: None,
+                clicks: vec![],
+                state: None,
+                task_id: None,
+                session_id: None,
+                reason: crate::RestoreReason::default(),
+            },
+            maki_agent::EventSender::new(tx, 0),
+        );
+        handle.wait_restore_complete_for_test();
+
+        let text: String = rx
+            .drain()
+            .filter_map(|env| match env.event {
+                maki_agent::AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot),
+                _ => None,
+            })
+            .last()
+            .expect("a restored body snapshot")
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("fn main() {}"), "got: {text}");
+        assert!(
+            !text.contains("wrote 12 bytes"),
+            "the summary is not the body: {text}"
+        );
+    }
+
+    #[test]
+    fn executor_host_rejects_tool_view_registration() {
+        let host = PluginHost::executor(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source(
+                "t",
+                r#"maki.api.register_tool_view({ tool = "x", done = function() end })"#,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains(EXECUTOR_GATE), "got: {err}");
+    }
+
+    const PUSHED_PLUGIN: &str = r#"---@permissions run
+maki.api.register_tool({
+    name = "pushed_one",
+    description = "d",
+    schema = { type = "object", properties = {} },
+    handler = function() return "ok" end,
+})
+"#;
+
+    #[test]
+    fn pushed_plugin_loads_on_an_executor_host() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::executor(Arc::clone(&reg)).unwrap();
+        host.load_pushed_plugin("demo", PUSHED_PLUGIN).unwrap();
+        assert!(reg.has("pushed_one"));
+    }
+
+    /// The push collects executor-role sources only; the role comes from the
+    /// origin, and no annotation is needed.
+    #[test]
+    fn pushed_plugin_without_annotations_loads() {
+        let host = PluginHost::executor(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_pushed_plugin("demo", "return {}").unwrap();
+    }
+
+    #[test]
+    fn pushed_plugin_with_an_unknown_permission_is_rejected() {
+        let host = PluginHost::executor(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_pushed_plugin("demo", "---@permissions fly\nreturn {}")
+            .unwrap_err();
+        assert!(
+            matches!(err, PluginError::InvalidAnnotations { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// A syntax error in a pushed source is a fatal startup error naming the
+    /// file; a clean push passes.
+    #[test]
+    fn check_plugin_sources_rejects_a_syntax_error_by_name() {
+        let mut push = maki_agent::mcp::push::ExecutorPush::default();
+        push.plugin_sources
+            .push(maki_agent::mcp::push::PluginSourcePush {
+                name: "good".into(),
+                source: "return {}".into(),
+            });
+        push.plugin_sources
+            .push(maki_agent::mcp::push::PluginSourcePush {
+                name: "broken".into(),
+                source: "local = 1".into(),
+            });
+        let err = check_plugin_sources(&push).unwrap_err();
+        assert!(err.contains("broken"), "got: {err}");
+        assert!(!err.contains("good"), "got: {err}");
+        push.plugin_sources.pop();
+        check_plugin_sources(&push).unwrap();
+    }
+
+    #[test]
+    fn single_process_host_reports_no_split() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "t",
+            r#"if maki.fn.has("split") ~= 0 then error("has(split) must be 0") end"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn brain_host_rejects_user_tool_registration() {
+        let host = PluginHost::with_role(
+            Arc::new(ToolRegistry::new()),
+            crate::role::HostRole::Brain,
+            true,
+        )
+        .unwrap();
+        let err = host
+            .load_source(
+                "t",
+                r#"maki.api.register_tool({
+                    name = "brain_tool",
+                    description = "d",
+                    schema = { type = "object", properties = {} },
+                    handler = function() return "ok" end,
+                })"#,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::api::tool::BRAIN_REGISTER_TOOL_ERR),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_host_keeps_the_tui_surface() {
+        let host = PluginHost::with_role(
+            Arc::new(ToolRegistry::new()),
+            crate::role::HostRole::Brain,
+            true,
+        )
+        .unwrap();
+        host.load_source(
+            "t",
+            r#"maki.api.register_command({ name = "x", handler = function() end })"#,
+        )
+        .unwrap();
+    }
+
     /// The second call sends `Shutdown` on a sender that is already
     /// disconnected; it must swallow that error and keep rejecting work.
     #[test]
@@ -1674,6 +2225,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(host.keymap_reader().load().entries.len(), 1);
+    }
+
+    /// A config dir with one file per autoload role: the brain file registers
+    /// a view, the executor file a tool.
+    fn autoload_config_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = dir.path().join("autoload/brain");
+        let executor = dir.path().join("autoload/executor");
+        std::fs::create_dir_all(&brain).unwrap();
+        std::fs::create_dir_all(&executor).unwrap();
+        std::fs::write(
+            brain.join("viewx.lua"),
+            r#"maki.api.register_tool_view({
+                tool = "x",
+                done = function() end,
+            })"#,
+        )
+        .unwrap();
+        std::fs::write(
+            executor.join("toolx.lua"),
+            r#"maki.api.register_tool({
+                name = "xtool",
+                description = "d",
+                schema = { type = "object", properties = {} },
+                handler = function() return "ok" end,
+            })"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Brain hosts load autoload/brain and never scan autoload/executor.
+    #[test]
+    fn brain_host_autoloads_only_brain_dir() {
+        let dir = autoload_config_dir();
+        let reg = Arc::new(ToolRegistry::new());
+        let host =
+            PluginHost::with_role(Arc::clone(&reg), crate::role::HostRole::Brain, true).unwrap();
+        let mut warnings = Vec::new();
+        host.load_init_files_from_dirs(
+            InitFiles::Global,
+            [dir.path().to_path_buf()],
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(reg.tool_view("x").is_some(), "brain dir loads");
+        assert!(!reg.has("xtool"), "the executor dir stays unscanned");
+    }
+
+    /// Single-process loads both roles' autoload dirs.
+    #[test]
+    fn single_process_autoloads_both_dirs() {
+        let dir = autoload_config_dir();
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        let mut warnings = Vec::new();
+        host.load_init_files_from_dirs(
+            InitFiles::Global,
+            [dir.path().to_path_buf()],
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(reg.tool_view("x").is_some());
+        assert!(reg.has("xtool"));
     }
 
     /// A handler that raises is logged and its key is spent: handing the key

@@ -175,6 +175,37 @@ pub(crate) struct PromptHintRegistration {
 
 pub(crate) type PromptHintCallbacks = BTreeMap<Arc<str>, Vec<PromptHintRegistration>>;
 
+/// Tool name → registered view callbacks, plus per-call state: a view's
+/// `start` returns a value that `progress` and `done` see again, keyed by
+/// call id. Executor hosts never populate it.
+#[derive(Default)]
+pub(crate) struct ToolViewStore {
+    pub(crate) fns: HashMap<Arc<str>, ViewFns>,
+    pub(crate) active: HashMap<Arc<str>, ActiveView>,
+}
+
+#[derive(Default)]
+pub(crate) struct ViewFns {
+    pub(crate) start: Option<RegistryKey>,
+    pub(crate) progress: Option<RegistryKey>,
+    pub(crate) done: Option<RegistryKey>,
+}
+
+pub(crate) struct ActiveView {
+    pub(crate) tool: Arc<str>,
+    pub(crate) state: Option<RegistryKey>,
+    /// The start task's cell: clicks route here for the whole call, then to
+    /// the warm cache at `done`, same as a native tool.
+    pub(crate) handle: TaskHandle,
+    /// Keeps the buf's handler slots alive past the start scope's drop.
+    pub(crate) claim: Arc<BufsClaim>,
+}
+
+/// The runtime's own request sender, for bridges calling in from outside the
+/// Lua thread (the display hook the tool registry hands to dispatch).
+#[derive(Clone)]
+pub(crate) struct RequestTx(pub(crate) flume::Sender<Request>);
+
 /// One source file of a plugin.
 ///
 /// A bundled plugin has exactly one. An external package has one per
@@ -406,6 +437,29 @@ pub enum Request {
         tool: Arc<str>,
         input: Value,
         reply: flume::Sender<HeaderResult>,
+    },
+    /// A registered view paints a call it does not execute: preview, then
+    /// one call per progress payload, then the final body. Every stage
+    /// replies, so dispatch stays ordered.
+    ViewStart {
+        tool: Arc<str>,
+        call_id: Arc<str>,
+        input: Value,
+        live: LiveCtx,
+        ctx: Box<LuaCtx>,
+        reply: flume::Sender<Option<String>>,
+    },
+    ViewProgress {
+        call_id: Arc<str>,
+        payload: Value,
+        reply: flume::Sender<()>,
+    },
+    ViewDone {
+        call_id: Arc<str>,
+        input: Value,
+        output: String,
+        is_error: bool,
+        reply: flume::Sender<()>,
     },
     ComputePermissionScopes {
         plugin: Arc<str>,
@@ -2212,6 +2266,7 @@ impl LuaRuntime {
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
         layered: Arc<LayeredTools>,
+        role: crate::role::HostRole,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let compiler = install_compiler(&lua, jit);
@@ -2246,6 +2301,8 @@ impl LuaRuntime {
         lua.set_app_data(crate::api::top::NotifyHandler::default());
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
+        lua.set_app_data(ToolViewStore::default());
+        lua.set_app_data(RequestTx(tx.clone()));
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(crate::api::pack::PackStore::default());
         lua.set_app_data(AutocmdStore::default());
@@ -2260,6 +2317,7 @@ impl LuaRuntime {
         });
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(keymap_writer);
+        lua.set_app_data(role);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(WinStore::default());
         lua.set_app_data(hint_writer);
@@ -2940,35 +2998,46 @@ async fn compute_header(
     };
 
     let result = run_detached(lua, func.call_async::<LuaValue>(input_lua)).await;
+    header_result_from_lua(tool, result)
+}
 
+/// The shared return contract of header and display fns: a plain string, or a
+/// buffer whose snapshot is the styled preview. Anything else (or a throw)
+/// falls back to the bare tool name.
+fn header_result_from_lua(tool: &str, result: mlua::Result<LuaValue>) -> HeaderResult {
     match result {
         Ok(LuaValue::String(s)) => match s.to_str() {
             Ok(s) => HeaderResult::plain(s.to_owned()),
-            Err(_) => HeaderResult::plain(tool.to_string()),
+            Err(_) => HeaderResult::plain(tool.to_owned()),
         },
         Ok(LuaValue::UserData(ud)) => match ud.borrow::<BufHandle>() {
             Ok(h) => HeaderResult::Styled(h.buf.take()),
-            Err(_) => HeaderResult::plain(tool.to_string()),
+            Err(_) => HeaderResult::plain(tool.to_owned()),
         },
-        Ok(_) => HeaderResult::plain(tool.to_string()),
+        Ok(_) => HeaderResult::plain(tool.to_owned()),
         Err(e) => {
-            tracing::warn!(plugin, tool, error = %e, "header fn call failed");
-            HeaderResult::plain(tool.to_string())
+            tracing::warn!(tool, error = %e, "preview render failed");
+            HeaderResult::plain(tool.to_owned())
         }
     }
 }
 
 async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Option<RestoreReply> {
-    let (func, plugin_name) = {
+    let found = {
         let plugins = plugins.borrow();
-        let (pname, tk) = plugins.iter().find_map(|(pname, owner)| {
-            owner
-                .tools
-                .get(&*item.tool)
-                .map(|keys| (pname.clone(), keys))
-        })?;
-        let key = tk.restore.as_ref()?;
-        (lua.registry_value::<Function>(key).ok()?, pname)
+        plugins.iter().find_map(|(pname, owner)| {
+            owner.tools.get(&*item.tool).and_then(|tk| {
+                let key = tk.restore.as_ref()?;
+                lua.registry_value::<Function>(key)
+                    .ok()
+                    .map(|func| (func, pname.clone()))
+            })
+        })
+    };
+    // No plugin owns a restore for it: a tool the brain never ran (an MCP
+    // tool, e.g. the executor's in split mode) replays through its view.
+    let Some((func, plugin_name)) = found else {
+        return restore_view(lua, &item).await;
     };
     let input_lua = json_to_lua(lua, &item.input).ok()?;
     let thread = lua.create_thread(func).ok()?;
@@ -3008,21 +3077,8 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
         lock_cell(scope.handle()).root_buf = Some(buf);
     }
 
-    if !item.clicks.is_empty()
-        && let Some(root) = resolve_root_buf(scope.handle())
-        && let Some(func) = crate::api::ui::buf::click_fn(&root)
-    {
-        for &row in &item.clicks {
-            let Ok(data) = lua.create_table() else {
-                break;
-            };
-            let _ = data.set("row", row);
-            if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
-                tracing::warn!(tool = &*item.tool, error = %e, "click replay failed");
-                break;
-            }
-            run_inline_tasks(lua, &scope).await;
-        }
+    if !item.clicks.is_empty() {
+        replay_clicks(lua, &scope, &item.clicks, &item.tool).await;
     }
 
     drop(scope);
@@ -3036,6 +3092,98 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
         );
     }
     Some(reply)
+}
+
+/// Replays the clicked rows after a restore so a tool's own toggle logic
+/// reproduces the expansion state the user last saw.
+async fn replay_clicks(lua: &Lua, scope: &TaskScope, clicks: &[usize], tool: &str) {
+    if clicks.is_empty() {
+        return;
+    }
+    let Some(root) = resolve_root_buf(scope.handle()) else {
+        return;
+    };
+    let Some(func) = crate::api::ui::buf::click_fn(&root) else {
+        return;
+    };
+    for &row in clicks {
+        let Ok(data) = lua.create_table() else {
+            break;
+        };
+        let _ = data.set("row", row);
+        if let Err(e) = scope.scope_future(func.call_async::<()>(data)).await {
+            tracing::warn!(tool, error = %e, "click replay failed");
+            break;
+        }
+        run_inline_tasks(lua, scope).await;
+    }
+}
+
+/// A tool the brain never ran has no plugin restore: its view replays
+/// instead — start(input) publishes the buf, done(state, input, output)
+/// finishes it — and the painted buf becomes the restored body.
+async fn restore_view(lua: &Lua, item: &RestoreItem) -> Option<RestoreReply> {
+    let (start_fn, done_fn) = {
+        let store = lua.app_data_ref::<ToolViewStore>()?;
+        let fns = store.fns.get(&*item.tool)?;
+        // `start` publishes the buf; a view without one has nothing to
+        // capture. `done` alone cannot paint, so both are required.
+        let resolve = |key: &RegistryKey| lua.registry_value::<Function>(key).ok();
+        (
+            fns.start.as_ref().and_then(resolve)?,
+            fns.done.as_ref().and_then(resolve)?,
+        )
+    };
+
+    let (dummy_tx, _) = flume::unbounded();
+    let cell = TaskCell::new(
+        CancelToken::none(),
+        Some(Instant::now() + RESTORE_ITEM_TIMEOUT),
+        Some(LiveCtx {
+            event_tx: maki_agent::EventSender::new(dummy_tx, 0),
+            tool_use_id: item.tool_use_id.clone(),
+        }),
+    );
+    let scope = TaskScope::new(lua, cell);
+    lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
+
+    let run = async {
+        let input_lua = json_to_lua(lua, &item.input).ok()?;
+        let ctx = lua
+            .create_userdata(LuaCtx::restore(RestoreCtx {
+                tool_output_lines: item.tool_output_lines,
+                state: item.state.clone(),
+                session_id: item.session_id.clone(),
+                task_id: item.task_id.clone(),
+                reason: item.reason,
+            }))
+            .ok()?;
+        let thread = lua.create_thread(start_fn).ok()?;
+        let ret = thread
+            .into_async::<MultiValue>((input_lua.clone(), ctx))
+            .ok()?
+            .await
+            .ok()?;
+        let state = ret.into_iter().next().unwrap_or(LuaValue::Nil);
+        let output = lua.create_string(&item.output).ok()?;
+        let thread = lua.create_thread(done_fn).ok()?;
+        thread
+            .into_async::<()>((state, input_lua, output, item.is_error))
+            .ok()?
+            .await
+            .ok()?;
+        Some(())
+    };
+    if scope.scope_future(run).await.is_none() {
+        tracing::warn!(tool = &*item.tool, "view restore failed");
+    }
+
+    run_inline_tasks(lua, &scope).await;
+    replay_clicks(lua, &scope, &item.clicks, &item.tool).await;
+
+    let body = resolve_root_buf(scope.handle()).map(|buf| buf.take());
+    drop(scope);
+    Some(RestoreReply { body, header: None })
 }
 
 /// Runs `maki.async.run` tasks queued during restore inline, so their
@@ -3624,6 +3772,88 @@ async fn run_hook(
 
 /// Sends no `ToolSnapshot` on completion: the preview buf must stay live so
 /// the UI keeps polling it until the handler's own `LiveToolBuf` takes over.
+/// A view's `start` runs exactly like a tool's: same task scope, same
+/// live-buffer channel. Its returns are the difference: a state value the
+/// runtime hands to progress/done, and an optional header summary. The task
+/// handle and claim come back so clicks route to the view's bufs for the
+/// call's whole life, the way a native tool's would.
+async fn run_view_start(
+    lua: &Lua,
+    func: Function,
+    tool: &str,
+    input: Value,
+    live: LiveCtx,
+    ctx: Box<LuaCtx>,
+) -> (
+    Option<RegistryKey>,
+    Option<String>,
+    TaskHandle,
+    Arc<BufsClaim>,
+) {
+    let scope = TaskScope::new(lua, TaskCell::new(ctx.cancel.clone(), None, Some(live)));
+    let handle = Arc::clone(scope.handle());
+    let claim = scope.bufs_claim();
+    let run = async {
+        let input_lua = json_to_lua(lua, &input)?;
+        let ctx_ud = lua.create_userdata(*ctx)?;
+        let thread = lua.create_thread(func)?;
+        let ret = thread
+            .into_async::<MultiValue>((input_lua, ctx_ud))?
+            .await?;
+        let state = match ret.front() {
+            None | Some(LuaValue::Nil) => None,
+            Some(v) => lua.create_registry_value(v.clone()).ok(),
+        };
+        let summary = match ret.get(1) {
+            Some(LuaValue::String(s)) => s.to_str().ok().map(|s| s.to_owned()),
+            _ => None,
+        };
+        Ok::<_, mlua::Error>((state, summary))
+    };
+    let (state, summary) = match scope.scope_future(run).await {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!(tool, error = %e, "view start failed");
+            (None, None)
+        }
+    };
+    (state, summary, handle, claim)
+}
+
+async fn run_view_progress(lua: &Lua, func: Function, state: Option<LuaValue>, payload: Value) {
+    let run = async {
+        let state = state.unwrap_or(LuaValue::Nil);
+        let payload = json_to_lua(lua, &payload)?;
+        let thread = lua.create_thread(func)?;
+        thread.into_async::<()>((state, payload))?.await
+    };
+    if let Err(e) = run.await {
+        tracing::warn!(error = %e, "view progress failed");
+    }
+}
+
+async fn run_view_done(
+    lua: &Lua,
+    func: Function,
+    state: Option<LuaValue>,
+    input: Value,
+    output: String,
+    is_error: bool,
+) {
+    let run = async {
+        let state = state.unwrap_or(LuaValue::Nil);
+        let input = json_to_lua(lua, &input)?;
+        let output = lua.create_string(&output)?;
+        let thread = lua.create_thread(func)?;
+        thread
+            .into_async::<()>((state, input, LuaValue::String(output), is_error))?
+            .await
+    };
+    if let Err(e) = run.await {
+        tracing::warn!(error = %e, "view done failed");
+    }
+}
+
 async fn run_tool_start(
     lua: &Lua,
     func: Function,
@@ -3812,6 +4042,7 @@ pub fn spawn(
     bundled_dirs: &'static [&'static Dir<'static>],
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
+    role: crate::role::HostRole,
 ) -> Result<LuaThread, PluginError> {
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
@@ -3851,6 +4082,7 @@ pub fn spawn(
                 jit,
                 plugin_rules,
                 layered_thread,
+                role,
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
@@ -4232,6 +4464,140 @@ pub fn spawn(
                             let res =
                                 compute_header(&rt.lua, &rt.plugins, &plugin, &tool, input).await;
                             let _ = reply.send(res);
+                        }
+                        Request::ViewStart {
+                            tool,
+                            call_id,
+                            input,
+                            live,
+                            ctx,
+                            reply,
+                        } => {
+                            let func = rt.lua.app_data_ref::<ToolViewStore>().and_then(|store| {
+                                let key = store.fns.get(&tool)?.start.as_ref()?;
+                                rt.lua.registry_value::<Function>(key).ok()
+                            });
+                            let Some(func) = func else {
+                                let _ = reply.send(None);
+                                continue;
+                            };
+                            let lua = rt.lua.clone();
+                            let live_tasks = Rc::clone(&rt.live_tasks);
+                            let g = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let slot = Some(g.acquire().await);
+                                let (state, summary, handle, claim) =
+                                    covered(slot, run_view_start(&lua, func, &tool, input, live, ctx))
+                                        .await;
+                                live_tasks
+                                    .borrow_mut()
+                                    .insert(call_id.to_string(), Arc::clone(&handle));
+                                if let Some(mut store) = lua.app_data_mut::<ToolViewStore>() {
+                                    store.active.insert(
+                                        call_id,
+                                        ActiveView {
+                                            tool,
+                                            state,
+                                            handle,
+                                            claim,
+                                        },
+                                    );
+                                }
+                                let _ = reply.send(summary);
+                            })
+                            .detach();
+                        }
+                        Request::ViewProgress {
+                            call_id,
+                            payload,
+                            reply,
+                        } => {
+                            let found = rt.lua.app_data_ref::<ToolViewStore>().and_then(|store| {
+                                let active = store.active.get(&call_id)?;
+                                let fns = store.fns.get(&active.tool)?;
+                                let func = fns
+                                    .progress
+                                    .as_ref()
+                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok());
+                                let state = active
+                                    .state
+                                    .as_ref()
+                                    .and_then(|key| rt.lua.registry_value::<LuaValue>(key).ok());
+                                func.map(|f| (f, state))
+                            });
+                            if let Some((func, state)) = found {
+                                let lua = rt.lua.clone();
+                                let g = Rc::clone(&gate);
+                                ex.spawn(async move {
+                                    let slot = Some(g.acquire().await);
+                                    covered(slot, run_view_progress(&lua, func, state, payload))
+                                        .await;
+                                    let _ = reply.send(());
+                                })
+                                .detach();
+                            } else {
+                                let _ = reply.send(());
+                            }
+                        }
+                        Request::ViewDone {
+                            call_id,
+                            input,
+                            output,
+                            is_error,
+                            reply,
+                        } => {
+                            let found = rt.lua.app_data_mut::<ToolViewStore>().and_then(|mut store| {
+                                let active = store.active.remove(&call_id)?;
+                                let func = store
+                                    .fns
+                                    .get(&active.tool)
+                                    .and_then(|v| v.done.as_ref())
+                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok());
+                                let state = active
+                                    .state
+                                    .as_ref()
+                                    .and_then(|key| rt.lua.registry_value::<LuaValue>(key).ok());
+                                if let Some(key) = active.state {
+                                    rt.lua.remove_registry_value(key).ok();
+                                }
+                                Some((func, state, active.handle, active.claim))
+                            });
+                            let Some((func, state, handle, claim)) = found else {
+                                let _ = reply.send(());
+                                continue;
+                            };
+                            rt.live_tasks.borrow_mut().remove(&*call_id);
+                            if let Some(root) = resolve_root_buf(&handle) {
+                                // Same as a finished native tool: the buf
+                                // answers clicks from the warm cache.
+                                let mut cell = TaskCell::new(CancelToken::none(), None, None);
+                                cell.root_buf = Some(root);
+                                let mut warm = rt.warm_tools.borrow_mut();
+                                warm.push_back(WarmTool {
+                                    id: call_id.to_string(),
+                                    handle: Arc::new(Mutex::new(cell)),
+                                    _claim: claim,
+                                });
+                                if warm.len() > WARM_TOOL_CAP {
+                                    warm.pop_front();
+                                }
+                            }
+                            if let Some(func) = func {
+                                let lua = rt.lua.clone();
+                                let g = Rc::clone(&gate);
+                                ex.spawn(async move {
+                                    let slot = Some(g.acquire().await);
+                                    covered(
+                                        slot,
+                                        run_view_done(&lua, func, state, input, output, is_error),
+                                    )
+                                    .await;
+                                    let _ = reply.send(());
+                                })
+                                .detach();
+                            } else {
+                                let _ = reply.send(());
+                            }
                         }
                         Request::ComputePermissionScopes {
                             plugin,

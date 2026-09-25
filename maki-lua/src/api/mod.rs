@@ -48,6 +48,27 @@ pub(crate) struct Owner {
     pub authority: DeclAuthority,
 }
 
+fn unavailable_table(lua: &Lua, ns: &str) -> LuaResult<Table> {
+    let message = format!("maki.{ns}: not available in executor-role plugins");
+    let t = lua.create_table()?;
+    let meta = lua.create_table()?;
+    let read_err = message.clone();
+    meta.set(
+        "__index",
+        lua.create_function(move |_, _: mlua::Variadic<Value>| -> LuaResult<()> {
+            Err(mlua::Error::runtime(read_err.clone()))
+        })?,
+    )?;
+    meta.set(
+        "__newindex",
+        lua.create_function(move |_, _: mlua::Variadic<Value>| -> LuaResult<()> {
+            Err(mlua::Error::runtime(message.clone()))
+        })?,
+    )?;
+    t.set_metatable(Some(meta))?;
+    Ok(t)
+}
+
 pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
@@ -95,7 +116,6 @@ pub(crate) fn create_maki_global(
         "net",
         net::create_net_table(lua, permissions, egress.clone())?,
     )?;
-    maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
     maki.set(
         "provider",
         provider::create_provider_namespace(
@@ -111,11 +131,25 @@ pub(crate) fn create_maki_global(
         "session",
         session::create_session_table(lua, ui_action_tx.clone())?,
     )?;
-    maki.set(
-        "model",
-        model::create_model_table(lua, ui_action_tx.clone())?,
-    )?;
-    maki.set("task", task::create_task_table(lua, ui_action_tx.clone())?)?;
+    let role = crate::role::current(lua);
+    if role.is_executor() {
+        for ns in ["keymap", "task", "plan", "model"] {
+            maki.set(ns, unavailable_table(lua, ns)?)?;
+        }
+    } else {
+        maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
+        maki.set(
+            "model",
+            model::create_model_table(lua, ui_action_tx.clone())?,
+        )?;
+        maki.set("task", task::create_task_table(lua, ui_action_tx.clone())?)?;
+        maki.set(
+            "keymap",
+            keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
+        )?;
+    }
+    // maki.ui self-gates per function: text utilities and flash work anywhere,
+    // window/input fns answer a loud error in executor-role plugins.
     maki.set(
         "ui",
         ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
@@ -138,10 +172,6 @@ pub(crate) fn create_maki_global(
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
     maki.set("agent", agent::create_agent_table(lua)?)?;
-    maki.set(
-        "keymap",
-        keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
-    )?;
     pack::add_packadd(lua, &maki)?;
     maki.set("pack", pack::create_pack_read_table(lua)?)?;
 

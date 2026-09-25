@@ -1336,6 +1336,29 @@ fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
     Ok(if found { 1 } else { 0 })
 }
 
+/// Report which side of the brain/executor split this host is, for plugins
+/// that carry both kinds of code and pick at load time. "split" answers
+/// whether any split applies, so a plugin can load in single-process mode
+/// and on the executor but skip a split brain. Single-process maki answers
+/// "brain": there is no executor to distinguish.
+///
+/// @param what string `"executor"`, `"brain"`, or `"split"`.
+/// @return (integer) `1` when the host runs in that role, `0` otherwise.
+/// @example
+/// if maki.fn.has("split") == 0 then
+///   -- register a tool; only possible without a split
+/// end
+#[lua_fn]
+fn has(lua: &Lua, what: String) -> LuaResult<i32> {
+    let role = crate::role::current(lua);
+    Ok(match what.as_str() {
+        "executor" => i32::from(role == crate::role::HostRole::Executor),
+        "brain" => i32::from(role != crate::role::HostRole::Executor),
+        "split" => i32::from(role != crate::role::HostRole::SingleProcess),
+        _ => 0,
+    })
+}
+
 /// Read the viewport of the focused chat transcript, like Neovim's
 /// `vim.fn.winsaveview()`. The transcript is the only scrollable window
 /// maki has, so there is no window argument.
@@ -1407,7 +1430,7 @@ lua_table! {
         jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
-        executable(perms),
+        executable(perms), has,
         winsaveview(tx), winrestview(tx),
     ]
 }

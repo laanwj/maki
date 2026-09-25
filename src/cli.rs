@@ -70,6 +70,12 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = InputFormat::Text)]
     pub input_format: InputFormat,
 
+    /// Run as the brain of a brain/executor split: unix socket the executor
+    /// listens on (started with `maki serve`). Overrides the [mcp.executor]
+    /// entry in mcp.toml
+    #[arg(long, env = "MAKI_EXECUTOR_SOCKET", value_name = "PATH")]
+    pub executor_socket: Option<PathBuf>,
+
     /// Skip loading custom commands from .maki/commands, .claude/commands, etc.
     #[arg(long)]
     pub no_commands: bool,
@@ -228,6 +234,16 @@ pub enum Command {
     },
     /// Run the index tool on a file to see how it looks like
     Index { path: String },
+    /// Run as an executor: serve the environment-effecting tools over a unix
+    /// socket for a brain process (brain/executor split)
+    Serve {
+        /// Unix socket path to listen on
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        /// Workspace root; defaults to the current directory
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+    },
     /// Manage MCP server authentication
     Mcp {
         #[command(subcommand)]
@@ -391,6 +407,17 @@ mod tests {
     #[test_case("code_execution", "code_execution"; "snake_passthrough")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn executor_socket_parses() {
+        let cli = Cli::parse_from(["maki", "--executor-socket", "/run/x/e.sock"]);
+        assert_eq!(
+            cli.executor_socket,
+            Some(std::path::PathBuf::from("/run/x/e.sock"))
+        );
+        let cli = Cli::parse_from(["maki"]);
+        assert_eq!(cli.executor_socket, None);
     }
 
     #[test]

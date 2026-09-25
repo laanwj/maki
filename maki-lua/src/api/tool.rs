@@ -15,7 +15,7 @@ use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, vali
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    is_tool_enabled, timeout_annotation,
+    ViewDone, ViewHook, ViewStart, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
@@ -39,13 +39,18 @@ use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
 use crate::runtime::{
-    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, RequestTx,
+    ToolViewStore, ViewFns, command_depth,
 };
 
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
+/// Brain-role hosts keep tool execution out of the key-holding process.
+pub(crate) const BRAIN_REGISTER_TOOL_ERR: &str = "register_tool: tools must live in \
+executor-role plugins in split mode; put the file in autoload/executor/ so the \
+brain ships it to the executor, or load it only when maki.fn.has(\"split\") == 0";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
@@ -272,6 +277,10 @@ impl Tool for LuaTool {
 
     fn required_permission(&self) -> Option<Permission> {
         Some(self.permission.as_ref()?.permission)
+    }
+
+    fn has_own_display(&self) -> bool {
+        self.has_header_fn || self.has_start_fn
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
@@ -713,9 +722,161 @@ fn register_tool(
     lua: &Lua,
     #[ctx] pending: PendingTools,
     #[ctx] permissions: PluginPermissions,
+    #[ctx] plugin: Arc<str>,
     spec: Table,
 ) -> LuaResult<()> {
+    let role = crate::role::current(lua);
+    if role == crate::role::HostRole::Brain && !crate::loader::is_bundled(&plugin) {
+        return Err(mlua::Error::runtime(BRAIN_REGISTER_TOOL_ERR));
+    }
     register_tool_from_lua(lua, &spec, pending, &permissions)
+}
+
+/// Register the view for a tool this host never runs: an MCP tool, e.g. the
+/// executor's tools in the brain/executor split. The view is the tool's whole
+/// presentation, painted with the full `maki.ui` surface from the brain's own
+/// Lua host; the executor only executes and emits progress.
+///
+/// Callbacks (at least one required):
+///   start(input, ctx)                  Paint the preview, exactly like a
+///     tool's own `start` (`ctx:live_buf`, `maki.ui`, config reads). May
+///     return a per-call state value, which `progress` and `done` get back,
+///     and optionally a header summary as the second return.
+///   progress(state, payload)           One call per payload the tool emits
+///     with `ctx:progress(...)`; the payload's JSON shape is the tool's own
+///     contract with its view.
+///   done(state, input, output, is_error)   Paint the final body.
+///
+/// Executor-role hosts reject this: views are UI-side. A native tool with its
+/// own `header`/`start` keeps it; the view serves tools that have neither.
+/// One view per tool name; a later registration replaces an earlier one.
+///
+/// Session restore replays `start(input)` then `done(state, input, output)` —
+/// no live executor needed, and the restored row keeps its click handlers.
+/// `ctx:live_buf` in `start` publishes the body to restore from; a view
+/// without `start` leaves restores to generic rendering.
+///
+/// @param spec table View specification:
+///   tool     (string)   Required. Qualified tool name (`server.tool`); the
+///     executor's own tools keep their bare names.
+///   start    (function) Optional. `function(input, ctx) -> state[, summary]`.
+///   progress (function) Optional. `function(state, payload)`.
+///   done     (function) Optional. `function(state, input, output, is_error)`.
+/// @return
+/// @example
+/// maki.api.register_tool_view({
+///   tool = "python",
+///   start = function(input, ctx)
+///     local buf = maki.ui.buf()
+///     for _, line in ipairs(maki.ui.highlight(input.code or "", "py") or {}) do
+///       buf:line(line)
+///     end
+///     ctx:live_buf(buf)
+///     return { buf = buf }, "running python"
+///   end,
+///   done = function(state) state.buf:line({ { "done", "dim" } }) end,
+/// })
+#[lua_fn]
+fn register_tool_view(lua: &Lua, spec: Table) -> LuaResult<()> {
+    if let Some(e) = crate::role::current(lua).executor_gate("register_tool_view") {
+        return Err(e);
+    }
+    let tool: String = spec.get("tool")?;
+    let start: Option<Function> = spec.get("start")?;
+    let progress: Option<Function> = spec.get("progress")?;
+    let done: Option<Function> = spec.get("done")?;
+    if start.is_none() && progress.is_none() && done.is_none() {
+        return Err(mlua::Error::runtime(
+            "register_tool_view: at least one of start, progress, done is required",
+        ));
+    }
+    let mut fns = ViewFns::default();
+    if let Some(f) = start {
+        fns.start = Some(lua.create_registry_value(f)?);
+    }
+    if let Some(f) = progress {
+        fns.progress = Some(lua.create_registry_value(f)?);
+    }
+    if let Some(f) = done {
+        fns.done = Some(lua.create_registry_value(f)?);
+    }
+    lua.app_data_mut::<ToolViewStore>()
+        .ok_or_else(|| mlua::Error::runtime("ToolViewStore not initialized"))?
+        .fns
+        .insert(Arc::from(tool.as_str()), fns);
+
+    let tx = lua
+        .app_data_ref::<RequestTx>()
+        .ok_or_else(|| mlua::Error::runtime("RequestTx not initialized"))?
+        .0
+        .clone();
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .ok_or_else(|| mlua::Error::runtime("ToolRegistry not initialized"))?
+        .clone();
+    let tool_name: Arc<str> = Arc::from(tool.as_str());
+
+    let start_tx = tx.clone();
+    let start_tool = Arc::clone(&tool_name);
+    let start_hook = Arc::new(move |vs: ViewStart| {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let live = LiveCtx {
+            event_tx: vs.ctx.event_tx.clone(),
+            tool_use_id: vs.call_id.to_string(),
+        };
+        let ctx = Box::new(crate::api::util::ctx::LuaCtx::start(&vs.ctx));
+        let sent = start_tx.send(Request::ViewStart {
+            tool: Arc::clone(&start_tool),
+            call_id: vs.call_id,
+            input: vs.input,
+            live,
+            ctx,
+            reply: reply_tx,
+        });
+        Box::pin(async move {
+            if sent.is_err() {
+                return None;
+            }
+            reply_rx.recv_async().await.ok().flatten()
+        }) as BoxFuture<'static, Option<String>>
+    });
+
+    let progress_tx = tx.clone();
+    let progress_hook = Arc::new(move |call_id: Arc<str>, payload: Value| {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let _ = progress_tx.send(Request::ViewProgress {
+            call_id,
+            payload,
+            reply: reply_tx,
+        });
+        Box::pin(async move {
+            let _ = reply_rx.recv_async().await;
+        }) as BoxFuture<'static, ()>
+    });
+
+    let done_hook = Arc::new(move |vd: ViewDone| {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let _ = tx.send(Request::ViewDone {
+            call_id: vd.call_id,
+            input: vd.input,
+            output: vd.output,
+            is_error: vd.is_error,
+            reply: reply_tx,
+        });
+        Box::pin(async move {
+            let _ = reply_rx.recv_async().await;
+        }) as BoxFuture<'static, ()>
+    });
+
+    registry.set_view(
+        &tool,
+        ViewHook {
+            start: start_hook,
+            progress: progress_hook,
+            done: done_hook,
+        },
+    );
+    Ok(())
 }
 
 /// Declare an agent permission rule for a native tool. Use it to pre-allow
@@ -753,10 +914,13 @@ fn register_tool(
 /// })
 #[lua_fn]
 fn register_permission_rule(
-    _lua: &Lua,
+    lua: &Lua,
     #[ctx] pending_rules: PendingRules,
     spec: Table,
 ) -> LuaResult<()> {
+    if let Some(e) = crate::role::current(lua).executor_gate("register_permission_rule") {
+        return Err(e);
+    }
     for entry in spec.pairs::<String, LuaValue>() {
         let (key, _) = entry.map_err(|_| {
             mlua::Error::runtime("register_permission_rule: spec keys must be strings")
@@ -911,6 +1075,9 @@ fn allow_is_delegated(
 /// })
 #[lua_fn]
 fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    if let Some(e) = crate::role::current(lua).executor_gate("register_command") {
+        return Err(e);
+    }
     register_command_from_lua(lua, &spec, plugin)
 }
 
@@ -1030,6 +1197,9 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 /// })
 #[lua_fn]
 fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+    if let Some(e) = crate::role::current(lua).executor_gate("set_prompt") {
+        return Err(e);
+    }
     let slot: Slot = parse_slot(&spec)?;
     if slot.kind() == SlotKind::Aggregate {
         return Err(mlua::Error::runtime(format!(
@@ -1137,8 +1307,8 @@ lua_table! {
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
-        register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
+        register_tool(pending, permissions, plugin), register_permission_rule(pending_rules), register_command(plugin),
+        register_tool_view, register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
     ]

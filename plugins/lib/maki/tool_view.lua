@@ -308,6 +308,18 @@ function ToolView.restore(output, opts)
   return ToolView.restore_lines(maki.split(output, "\n"), opts)
 end
 
+-- Same render into an existing buf: a brain-side view's `done` gets no ctx to
+-- publish a buf with, so it fills the one its `start` published.
+function ToolView.populate(buf, text, opts)
+  local view = ToolView.new(buf, opts)
+  view:append_text(text)
+  view:finish()
+  buf:on("click", function()
+    view:toggle()
+  end)
+  return buf
+end
+
 -- Same, for tools whose live output goes through markdown (`format =
 -- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
 -- live.

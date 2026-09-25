@@ -626,11 +626,31 @@ fn tick_drains_the_highlight_worker() {
         );
         std::thread::yield_now();
     }
+    assert!(seg_text(&panel, "t1").contains(HIGHLIGHTED_CODE));
+}
 
-    assert!(
-        seg_text(&panel, "t1").contains(HIGHLIGHTED_CODE),
-        "the applied result replaces the highlight range in place"
+/// The view-channel case: a view mutates its live buf between agent events,
+/// and the panel's own tick has to notice. (The event loop still needs a wake
+/// to call tick; the pump sends one per payload.)
+#[test]
+fn live_buf_mutations_repaint_on_tick_without_agent_events() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.set_lines(vec![snap_line("first")]);
+    panel.register_live_buf("t1".into(), Arc::clone(&buf));
+    panel.tool_start(start("t1", "python")); // stays InProgress
+    let _ = panel.tick(); // the poll lands the live buf's first lines
+    render(&mut panel, 80, 10);
+    assert!(seg_text(&panel, "t1").contains("first"));
+
+    buf.set_lines(vec![snap_line("first"), snap_line("second")]);
+    assert_eq!(
+        panel.tick(),
+        Dirty::YES,
+        "a mutated live buf must dirty the panel"
     );
+    render(&mut panel, 80, 10);
+    assert!(seg_text(&panel, "t1").contains("second"));
 }
 
 #[test]

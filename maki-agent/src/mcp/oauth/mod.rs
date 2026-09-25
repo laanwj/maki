@@ -62,7 +62,8 @@ pub async fn authenticate(
         server: server_name.into(),
         reason: e.to_string(),
     };
-    let client = build_client(HTTP_TIMEOUT, ca_file).map_err(|e| wrap(OAuthError::Other(e)))?;
+    let client =
+        build_client(Some(HTTP_TIMEOUT), ca_file).map_err(|e| wrap(OAuthError::Other(e)))?;
 
     if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
         && let Some(ref tokens) = existing.tokens
@@ -248,7 +249,8 @@ pub async fn silent_refresh(
         return Ok(None);
     }
 
-    let client = build_client(SILENT_REFRESH_HTTP_TIMEOUT, ca_file).map_err(OAuthError::Other)?;
+    let client =
+        build_client(Some(SILENT_REFRESH_HTTP_TIMEOUT), ca_file).map_err(OAuthError::Other)?;
 
     // Trust the endpoint pinned at interactive auth over fresh discovery: a
     // later-compromised server must not redirect the refresh token (and any

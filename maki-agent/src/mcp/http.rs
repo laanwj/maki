@@ -55,16 +55,18 @@ struct Negotiated {
 /// missing bundle still shows as disabled. Without the check, a missing file would only
 /// show up on the first request, as a confusing TLS error.
 pub(super) fn build_client(
-    timeout: Duration,
+    timeout: Option<Duration>,
     ca_file: Option<&Path>,
 ) -> Result<HttpClient, String> {
-    let builder = HttpClient::builder()
+    let mut builder = HttpClient::builder()
         .redirect_policy(RedirectPolicy::Limit(MAX_REDIRECTS))
         // The workspace enables curl's http2 feature for OTLP over gRPC,
         // which would otherwise flip this transport to h2 over TLS. Its
         // streaming responses are tuned for HTTP/1.1, so pin it.
-        .version_negotiation(VersionNegotiation::http11())
-        .timeout(timeout);
+        .version_negotiation(VersionNegotiation::http11());
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
     let builder = match ca_file {
         Some(path) if !path.is_file() => {
             return Err(format!("ca_file '{}' is not a file", path.display()));
@@ -80,7 +82,7 @@ impl HttpTransport {
         name: &str,
         url: &str,
         headers: &HashMap<String, String>,
-        timeout: Duration,
+        timeout: Option<Duration>,
         storage: Option<StateDir>,
         ca_file: Option<&Path>,
     ) -> Result<Self, McpError> {
@@ -551,7 +553,7 @@ mod tests {
             "srv",
             &url,
             &HashMap::new(),
-            PENDING_REQUEST_TIMEOUT,
+            Some(PENDING_REQUEST_TIMEOUT),
             None,
             None,
         )
@@ -691,7 +693,7 @@ mod tests {
         headers: HashMap<String, String>,
         storage: Option<StateDir>,
     ) -> HttpTransport {
-        HttpTransport::new("srv", url, &headers, TRANSPORT_TIMEOUT, storage, None).unwrap()
+        HttpTransport::new("srv", url, &headers, Some(TRANSPORT_TIMEOUT), storage, None).unwrap()
     }
 
     #[test_case("missing.pem" ; "missing_file")]
@@ -703,7 +705,7 @@ mod tests {
             "srv",
             "http://127.0.0.1:1/mcp",
             &HashMap::new(),
-            TRANSPORT_TIMEOUT,
+            Some(TRANSPORT_TIMEOUT),
             None,
             Some(&ca_file),
         ) else {

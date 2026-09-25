@@ -39,16 +39,13 @@ function M.list(path, ctx)
   }
 end
 
-function M.view(text, ctx)
+function M.opts(ctx)
   local tol = ctx:tool_output_lines()
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, { max_lines = (tol and tol.read) or DEFAULT_MAX_LINES, keep = "head" })
-  view:append_text(text)
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
+  return { max_lines = (tol and tol.read) or DEFAULT_MAX_LINES, keep = "head" }
+end
+
+function M.view(text, ctx)
+  return ToolView.populate(maki.ui.buf(), text, M.opts(ctx))
 end
 
 return M

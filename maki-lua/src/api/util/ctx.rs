@@ -268,12 +268,45 @@ impl UserData for LuaCtx {
             Ok((Some(<&str>::from(reason)), None))
         });
 
-        methods.add_method("live_buf", |lua, this, buf: mlua::AnyUserData| {
-            if matches!(this.caps, Caps::Restore { .. }) {
-                return Ok(this.cap_err_pair("live_buf"));
+        methods.add_method("progress", |lua, _this, payload: LuaValue| {
+            let Some(live) = ({
+                let task = active_task(lua);
+                lock_cell(&task).live.clone()
+            }) else {
+                tracing::warn!("ctx:progress outside a tool call's live context; payload dropped");
+                return Ok(_this.cap_err_pair("progress"));
+            };
+            let payload_json: serde_json::Value = lua.from_value(payload.clone())?;
+            let _ = live.event_tx.send(maki_agent::AgentEvent::ToolProgress {
+                id: live.tool_use_id.clone(),
+                payload: payload_json.clone(),
+            });
+            // A view active on this call in the same VM gets the payload
+            // inline; in split mode the event above crosses the wire instead.
+            if let Some(tx) = lua.app_data_ref::<crate::runtime::RequestTx>() {
+                let store = lua.app_data_ref::<crate::runtime::ToolViewStore>();
+                let has_view = store
+                    .as_ref()
+                    .is_some_and(|s| s.active.contains_key(live.tool_use_id.as_str()));
+                drop(store);
+                if has_view {
+                    let (reply_tx, _) = flume::bounded(1);
+                    let _ = tx.0.send(crate::runtime::Request::ViewProgress {
+                        call_id: Arc::from(live.tool_use_id.as_str()),
+                        payload: payload_json,
+                        reply: reply_tx,
+                    });
+                }
             }
-            send_live_buf(lua, &buf)?;
             Ok((Some(true), None))
+        });
+
+        methods.add_method("live_buf", |lua, _this, buf: mlua::AnyUserData| {
+            // No restore-ctx gate: there is no live channel there, but binding
+            // the buf still marks the task's root buf, which is how a replayed
+            // view's painted body gets captured.
+            send_live_buf(lua, &buf)?;
+            Ok((Some(true), None::<String>))
         });
 
         methods.add_method("config", |lua, this, args: MultiValue| {

@@ -348,7 +348,7 @@ pub(crate) fn requested_permissions_from_text(
 
 pub(crate) fn denied_error(perm: Permission) -> LuaError {
     let msg = format!(
-        "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
+        "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} or a ---@permissions annotation next to the plugin file)"
     );
     warn!(permission = %perm, "{msg}");
     LuaError::runtime(msg)
@@ -375,6 +375,25 @@ pub(crate) fn check_plugin_compatibility(
         return Ok(());
     };
     check_minimum_version(plugin, required, RUNTIME_VERSION)
+}
+
+/// `---@permissions` annotations grant what they name; anything else stays
+/// denied. Shared by the push loader and the autoload scan.
+pub(crate) fn permissions_from_annotations(
+    plugin: &str,
+    annotations: &maki_config::PluginAnnotations,
+) -> Result<PluginPermissions, PluginError> {
+    let mut permissions = PluginPermissions::denied();
+    for permission_name in &annotations.permissions {
+        let Some(permission) = maki_config::Permission::from_key(permission_name) else {
+            return Err(PluginError::InvalidAnnotations {
+                plugin: plugin.into(),
+                message: format!("unknown permission {permission_name:?} in annotations"),
+            });
+        };
+        permissions.set(permission, true);
+    }
+    Ok(permissions)
 }
 
 fn load_plugin_manifest(plugin_dir: Option<&Path>) -> Option<toml::Value> {

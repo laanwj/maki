@@ -16,9 +16,24 @@ const MAX_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Debug, Clone)]
 pub enum McpConfigError {
-    Read { path: PathBuf, error: String },
-    Parse { path: PathBuf, error: String },
+    Read {
+        path: PathBuf,
+        error: String,
+    },
+    Parse {
+        path: PathBuf,
+        error: String,
+    },
+    /// stdio servers spawn children, which the brain never does in split mode.
+    BrainStdio {
+        servers: String,
+    },
+    /// `executor` is the reserved server name for the brain/executor split.
+    ExecutorNotSocket,
 }
+
+/// The reserved MCP server name that turns on brain/executor split mode.
+pub const EXECUTOR_SERVER_NAME: &str = "executor";
 
 /// Generates a compacted but still human-meaningful version of a path.
 fn compact_path(path: &Path, base_path: &Path) -> String {
@@ -52,7 +67,7 @@ impl McpConfigErrors {
         }
     }
 
-    fn add_error(&mut self, e: McpConfigError) {
+    pub(crate) fn add_error(&mut self, e: McpConfigError) {
         self.errors.push(e);
     }
 
@@ -73,6 +88,13 @@ impl std::fmt::Display for McpConfigErrors {
                 }
                 McpConfigError::Parse { path, .. } => {
                     format!("failed to parse {}", compact_path(path, &self.initial_wd))
+                }
+                McpConfigError::BrainStdio { servers } => {
+                    format!("stdio MCP servers belong to the executor in split mode: {servers}")
+                }
+                McpConfigError::ExecutorNotSocket => {
+                    "server 'executor' is reserved for the brain/executor split and must use a socket path"
+                        .to_string()
                 }
             });
         if let Some(first) = shown.next() {
@@ -136,9 +158,13 @@ pub struct McpConfig {
     pub mcp: HashMap<String, RawServerConfig>,
     #[serde(skip)]
     pub origins: HashMap<String, PathBuf>,
+    /// Extra initialize params per server, set at runtime (the brain's
+    /// executor config push). Never from disk.
+    #[serde(skip)]
+    pub init_extras: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, serde::Serialize, Clone)]
 pub struct RawServerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -162,7 +188,7 @@ impl RawServerConfig {
     }
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, serde::Serialize, Clone)]
 #[serde(untagged)]
 pub enum RawTransport {
     Stdio(RawStdioFields),
@@ -170,14 +196,14 @@ pub enum RawTransport {
     Socket(RawSocketFields),
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, serde::Serialize, Clone)]
 pub struct RawStdioFields {
     pub command: Vec<String>,
     #[serde(default)]
     pub environment: HashMap<String, String>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, serde::Serialize, Clone)]
 pub struct RawHttpFields {
     pub url: String,
     #[serde(default)]
@@ -189,7 +215,7 @@ pub struct RawHttpFields {
     pub ca_file: Option<String>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, serde::Serialize, Clone)]
 pub struct RawSocketFields {
     pub path: PathBuf,
 }
@@ -197,15 +223,20 @@ pub struct RawSocketFields {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub name: String,
-    pub timeout: Duration,
+    /// `None` for the executor: its tools bound their own runs, and its
+    /// handshake waits on downstream servers connecting.
+    pub timeout: Option<Duration>,
     /// Skip deferral: every tool from this server enters the context upfront
     /// instead of being discoverable through `tool_search`.
     pub always_load: bool,
     pub transport: Transport,
+    /// Runtime-only extras merged into the initialize params (the brain's
+    /// executor config push).
+    pub init_extra: Option<serde_json::Value>,
 }
 
 /// Static OAuth client used when the server has no registration endpoint.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, serde::Serialize, Clone, Debug)]
 pub struct OauthClientConfig {
     pub client_id: String,
     #[serde(default)]
@@ -373,11 +404,13 @@ pub fn parse_server(
             }
         }
     };
+    let timeout = (name != EXECUTOR_SERVER_NAME).then(|| Duration::from_millis(server.timeout));
     Ok(ServerConfig {
         name,
-        timeout: Duration::from_millis(server.timeout),
+        timeout,
         always_load: server.always_load,
         transport,
+        init_extra: None,
     })
 }
 
@@ -640,6 +673,23 @@ environment = { GITHUB_TOKEN = "${MAKI_TEST_MCP_ENV_84421}" }
             }
             _ => panic!("expected Stdio"),
         }
+    }
+
+    #[test]
+    fn executor_gets_no_request_timeout() {
+        let raw = || {
+            RawServerConfig::runtime(RawTransport::Socket(RawSocketFields {
+                path: "/x.sock".into(),
+            }))
+        };
+        let exec =
+            parse_server(EXECUTOR_SERVER_NAME.into(), raw(), Path::new(CONFIG_PATH)).unwrap();
+        assert_eq!(exec.timeout, None);
+        let other = parse_server("other".into(), raw(), Path::new(CONFIG_PATH)).unwrap();
+        assert_eq!(
+            other.timeout,
+            Some(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+        );
     }
 
     #[test_case(0               ; "zero")]

@@ -2,6 +2,7 @@
 //! path, no parallel lists that can drift.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -241,6 +242,11 @@ pub trait Tool: Send + Sync + 'static {
         None
     }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
+    /// Whether the tool paints its own call display (header/start callbacks).
+    /// A registered view drives only tools without one.
+    fn has_own_display(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -270,12 +276,41 @@ pub struct ToolRegistry {
     /// The agent loop's own slots. They live here because the registry is the
     /// one handle every run already carries.
     agent_hook: ArcSwapOption<Box<dyn AgentHook>>,
+    /// Views keyed by tool name. Lua-registered, so they are cleared with
+    /// the rest of the Lua surface.
+    views: ArcSwap<HashMap<Arc<str>, ViewHook>>,
 }
 
 /// `ArcSwapOption` needs a sized payload, hence the `Box`. Auto-deref hides
 /// it at every call site.
 pub type InstalledHook = Arc<Box<dyn ToolHook>>;
 pub type InstalledAgentHook = Arc<Box<dyn AgentHook>>;
+
+/// Lifecycle of one view invocation: `start` paints the preview and reports
+/// the header text, `progress` consumes the tool's structured payloads,
+/// `done` paints the final body from the result text.
+#[derive(Clone)]
+pub struct ViewHook {
+    pub start: Arc<dyn Fn(ViewStart) -> BoxFuture<'static, Option<String>> + Send + Sync>,
+    pub progress: Arc<dyn Fn(Arc<str>, Value) -> BoxFuture<'static, ()> + Send + Sync>,
+    pub done: Arc<dyn Fn(ViewDone) -> BoxFuture<'static, ()> + Send + Sync>,
+}
+
+/// What a view's `start` needs: the call's id and input, plus the dispatch
+/// context the live-buffer channel reads from.
+pub struct ViewStart {
+    pub call_id: Arc<str>,
+    pub tool: Arc<str>,
+    pub input: Value,
+    pub ctx: ToolContext,
+}
+
+pub struct ViewDone {
+    pub call_id: Arc<str>,
+    pub input: Value,
+    pub output: String,
+    pub is_error: bool,
+}
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -295,6 +330,7 @@ impl ToolRegistry {
             tools: ArcSwap::from_pointee(Vec::new()),
             hook: ArcSwapOption::empty(),
             agent_hook: ArcSwapOption::empty(),
+            views: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
@@ -318,6 +354,20 @@ impl ToolRegistry {
 
     pub fn agent_hook(&self) -> Option<InstalledAgentHook> {
         self.agent_hook.load_full()
+    }
+
+    /// Last registration wins, matching how a reload replaces a plugin's
+    /// tools.
+    pub fn set_view(&self, tool: &str, view: ViewHook) {
+        self.views.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(Arc::from(tool), view.clone());
+            next
+        });
+    }
+
+    pub fn tool_view(&self, tool: &str) -> Option<ViewHook> {
+        self.views.load().get(tool).cloned()
     }
 
     /// The process-wide registry. Every tool in it comes from a Lua plugin
@@ -453,6 +503,7 @@ impl ToolRegistry {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        self.views.rcu(|_| HashMap::new());
     }
 
     pub fn clear_plugin(&self, plugin: &str) {
@@ -645,6 +696,23 @@ mod tests {
     /// `/reload` re-registers the same lua tool names, so anything
     /// `clear_lua` leaves behind becomes a `NameConflict` that breaks every
     /// later reload.
+    #[test]
+    fn views_clear_with_the_lua_surface() {
+        let reg = ToolRegistry::new();
+        assert!(reg.tool_view("python").is_none());
+        reg.set_view(
+            "python",
+            ViewHook {
+                start: Arc::new(|_| Box::pin(async { None })),
+                progress: Arc::new(|_, _| Box::pin(async {})),
+                done: Arc::new(|_| Box::pin(async {})),
+            },
+        );
+        assert!(reg.tool_view("python").is_some());
+        reg.clear_lua();
+        assert!(reg.tool_view("python").is_none());
+    }
+
     #[test]
     fn clear_lua_removes_lua_keeps_mcp_and_allows_reregistration() {
         let reg = ToolRegistry::new();

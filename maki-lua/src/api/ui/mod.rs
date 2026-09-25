@@ -751,8 +751,31 @@ pub(crate) fn create_ui_table(
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
 
+    let role = crate::role::current(lua);
     if let Some(tx) = ui_action_tx {
+        // flash doubles as maki.notify's transport, which the executor forwards
+        // to the brain as an MCP logging notification.
         flash__register(&t, lua, tx.clone())?;
+        if role.is_executor() {
+            for name in [
+                "action",
+                "open_editor",
+                "input",
+                "input_edit",
+                "open_win",
+                "set_window_title",
+                "set_status_hint",
+            ] {
+                let what = format!("maki.ui.{name}");
+                t.set(
+                    name,
+                    lua.create_function(move |_, (): ()| -> LuaResult<()> {
+                        Err(crate::role::executor_gate_error(&what))
+                    })?,
+                )?;
+            }
+            return Ok(t);
+        }
         set_window_title__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;

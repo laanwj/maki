@@ -22,14 +22,21 @@ const INVALID_PARAMS: i64 = -32602;
 pub trait ServerHandler: Send + Sync + 'static {
     /// Called on `initialize`; for the executor the params carry the
     /// brain-pushed config blob. Rejecting the handshake rejects the connection.
-    fn initialize(&self, params: Value) -> Result<(), String>;
+    fn initialize<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, String>>;
+    /// Answered by `maki/workspace` probes, before or without any initialize.
+    /// Deliberately not initialize: a probe must not configure anything.
+    fn workspace(&self) -> String;
     fn tools(&self) -> Vec<ToolInfo>;
     fn resources(&self) -> Vec<ResourceInfo>;
     fn read_resource(&self, uri: &str) -> Result<Vec<ResourceContent>, String>;
+    /// `session_id`/`task_id` name the chat (and subagent task) the call
+    /// serves, from the request's `_meta`; `None` for sessionless callers.
     fn call_tool<'a>(
         &'a self,
         name: &'a str,
         args: Value,
+        session_id: Option<String>,
+        task_id: Option<String>,
         progress: ProgressSink,
         cancel: CancelToken,
     ) -> BoxFuture<'a, Result<CallToolResult, String>>;
@@ -98,6 +105,7 @@ impl ProgressSink {
 pub async fn serve_unix<H: ServerHandler>(
     listener: UnixListener,
     handler: Arc<H>,
+    notify: flume::Receiver<String>,
 ) -> Result<(), McpError> {
     loop {
         let (stream, _) = listener.accept().await.map_err(|e| McpError::StartFailed {
@@ -105,8 +113,9 @@ pub async fn serve_unix<H: ServerHandler>(
             reason: e.to_string(),
         })?;
         let handler = Arc::clone(&handler);
+        let notify = notify.clone();
         smol::spawn(async move {
-            if let Err(e) = run_conn(stream, handler).await {
+            if let Err(e) = run_conn(stream, handler, notify).await {
                 debug!(error = %e, "MCP connection closed");
             }
         })
@@ -114,10 +123,29 @@ pub async fn serve_unix<H: ServerHandler>(
     }
 }
 
-async fn run_conn<H: ServerHandler>(stream: UnixStream, handler: Arc<H>) -> Result<(), McpError> {
+async fn run_conn<H: ServerHandler>(
+    stream: UnixStream,
+    handler: Arc<H>,
+    notify: flume::Receiver<String>,
+) -> Result<(), McpError> {
     let writer = ConnWriter {
         inner: Arc::new(Mutex::new(stream.clone())),
     };
+    // Plugin notifications that arrived while nobody was connected are stale.
+    while notify.try_recv().is_ok() {}
+    {
+        let writer = writer.clone();
+        smol::spawn(async move {
+            while let Ok(message) = notify.recv_async().await {
+                let params = json!({ "level": "info", "data": message });
+                let note = JsonRpcNotification::new("notifications/message", Some(params));
+                if writer.write_json(&note).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
     let in_flight: Arc<Mutex<HashMap<u64, CancelTrigger>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -184,17 +212,23 @@ async fn handle_request<H: ServerHandler>(
     cancel: CancelToken,
 ) -> Value {
     match method {
-        "initialize" => match handler.initialize(params.unwrap_or(Value::Null)) {
-            Ok(()) => result_value(
-                id,
-                json!({
+        "initialize" => match handler.initialize(params.unwrap_or(Value::Null)).await {
+            Ok(extras) => {
+                let mut result = json!({
                     "protocolVersion": LATEST_PROTOCOL_VERSION,
                     "capabilities": { "tools": {}, "resources": {} },
                     "serverInfo": { "name": "maki-executor", "version": env!("CARGO_PKG_VERSION") },
-                }),
-            ),
+                });
+                if let (Some(extras), Some(map)) = (extras.as_object(), result.as_object_mut()) {
+                    for (key, value) in extras {
+                        map.insert(key.clone(), value.clone());
+                    }
+                }
+                result_value(id, result)
+            }
             Err(e) => error_value(id, INVALID_PARAMS, e),
         },
+        "maki/workspace" => result_value(id, json!(handler.workspace())),
         "ping" => result_value(id, json!({})),
         "tools/list" => result_value(id, json!({ "tools": handler.tools() })),
         "resources/list" => result_value(id, json!({ "resources": handler.resources() })),
@@ -216,6 +250,14 @@ async fn handle_request<H: ServerHandler>(
                 .and_then(|p| p["arguments"].as_object().cloned())
                 .map(Value::Object)
                 .unwrap_or_else(|| json!({}));
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p["_meta"]["maki_session_id"].as_str())
+                .map(str::to_owned);
+            let task_id = params
+                .as_ref()
+                .and_then(|p| p["_meta"]["maki_task_id"].as_str())
+                .map(str::to_owned);
             let progress = ProgressSink {
                 token: params
                     .as_ref()
@@ -223,11 +265,14 @@ async fn handle_request<H: ServerHandler>(
                     .filter(|t| !t.is_null()),
                 writer: Some(writer),
             };
-            match handler.call_tool(name, args, progress, cancel).await {
+            match handler
+                .call_tool(name, args, session_id, task_id, progress, cancel)
+                .await
+            {
                 Ok(result) => result_value(id, serde_json::to_value(result).unwrap_or(Value::Null)),
                 Err(message) => result_value(
                     id,
-                    json!({ "content": [{ "text": message }], "isError": true }),
+                    json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
                 ),
             }
         }
@@ -254,8 +299,11 @@ mod tests {
     struct FakeHandler;
 
     impl ServerHandler for FakeHandler {
-        fn initialize(&self, _params: Value) -> Result<(), String> {
-            Ok(())
+        fn initialize<'a>(&'a self, _params: Value) -> BoxFuture<'a, Result<Value, String>> {
+            Box::pin(async { Ok(json!({})) })
+        }
+        fn workspace(&self) -> String {
+            "/ws".into()
         }
         fn tools(&self) -> Vec<ToolInfo> {
             vec![ToolInfo {
@@ -283,15 +331,23 @@ mod tests {
             &'a self,
             name: &'a str,
             args: Value,
+            session_id: Option<String>,
+            task_id: Option<String>,
             progress: ProgressSink,
             cancel: CancelToken,
         ) -> BoxFuture<'a, Result<CallToolResult, String>> {
             Box::pin(async move {
                 match name {
                     "echo" => Ok(CallToolResult {
-                        content: vec![CallToolContent {
-                            text: args["text"].as_str().unwrap_or("").into(),
-                        }],
+                        content: vec![CallToolContent::text(args["text"].as_str().unwrap_or(""))],
+                        is_error: false,
+                    }),
+                    "whoami" => Ok(CallToolResult {
+                        content: vec![CallToolContent::text(format!(
+                            "{}:{}",
+                            session_id.as_deref().unwrap_or("-"),
+                            task_id.as_deref().unwrap_or("-")
+                        ))],
                         is_error: false,
                     }),
                     "hang" => {
@@ -304,11 +360,9 @@ mod tests {
                             })
                     }
                     "progress" => {
-                        progress.send(json!({ "chunk": "half" })).await;
+                        progress.send(json!({ "content": "half-way" })).await;
                         Ok(CallToolResult {
-                            content: vec![CallToolContent {
-                                text: "done".into(),
-                            }],
+                            content: vec![CallToolContent::text("done")],
                             is_error: false,
                         })
                     }
@@ -322,9 +376,17 @@ mod tests {
         dir: &tempfile::TempDir,
         handler: H,
     ) -> std::path::PathBuf {
+        spawn_server_notify(dir, handler, flume::unbounded().1)
+    }
+
+    fn spawn_server_notify<H: ServerHandler>(
+        dir: &tempfile::TempDir,
+        handler: H,
+        notify: flume::Receiver<String>,
+    ) -> std::path::PathBuf {
         let path = dir.path().join("srv.sock");
         let listener = UnixListener::bind(&path).expect("bind");
-        smol::spawn(serve_unix(listener, Arc::new(handler))).detach();
+        smol::spawn(serve_unix(listener, Arc::new(handler), notify)).detach();
         path
     }
 
@@ -337,7 +399,7 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let path = spawn_server(&dir);
-            let client = SocketTransport::connect("test", &path, Duration::from_secs(5))
+            let client = SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
                 .await
                 .unwrap();
 
@@ -352,7 +414,8 @@ mod tests {
             let out = transport::call_tool(&client, "echo", &json!({ "text": "hi" }))
                 .await
                 .unwrap();
-            assert_eq!(out, "hi");
+            assert_eq!(out.text, "hi");
+            assert!(out.image.is_none());
 
             let err = transport::call_tool(&client, "nope", &json!({}))
                 .await
@@ -362,11 +425,24 @@ mod tests {
     }
 
     #[test]
+    fn workspace_probe_needs_no_initialize() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = spawn_server(&dir);
+            let client = SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+            let result = client.send_request("maki/workspace", None).await.unwrap();
+            assert_eq!(result, json!("/ws"));
+        });
+    }
+
+    #[test]
     fn resources_list_and_read() {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let path = spawn_server(&dir);
-            let client = SocketTransport::connect("test", &path, Duration::from_secs(5))
+            let client = SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
                 .await
                 .unwrap();
 
@@ -386,7 +462,7 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let path = spawn_server(&dir);
-            let client = SocketTransport::connect("test", &path, Duration::from_secs(5))
+            let client = SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
                 .await
                 .unwrap();
             let err = client.send_request("bogus/method", None).await.unwrap_err();
@@ -407,8 +483,11 @@ mod tests {
     }
 
     impl ServerHandler for HangHandler {
-        fn initialize(&self, _params: Value) -> Result<(), String> {
-            Ok(())
+        fn initialize<'a>(&'a self, _params: Value) -> BoxFuture<'a, Result<Value, String>> {
+            Box::pin(async { Ok(json!({})) })
+        }
+        fn workspace(&self) -> String {
+            "/ws".into()
         }
         fn tools(&self) -> Vec<ToolInfo> {
             vec![]
@@ -423,6 +502,8 @@ mod tests {
             &'a self,
             _name: &'a str,
             _args: Value,
+            _session_id: Option<String>,
+            _task_id: Option<String>,
             _progress: ProgressSink,
             cancel: CancelToken,
         ) -> BoxFuture<'a, Result<CallToolResult, String>> {
@@ -451,7 +532,7 @@ mod tests {
                 },
             );
             let client = Arc::new(
-                SocketTransport::connect("test", &path, Duration::from_secs(5))
+                SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
                     .await
                     .unwrap(),
             );
@@ -472,6 +553,124 @@ mod tests {
 
             let err = call.await.unwrap_err();
             assert!(err.to_string().contains("cancelled"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn client_routes_progress_and_messages() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (notify_tx, notify_rx) = flume::unbounded();
+            let path = spawn_server_notify(&dir, FakeHandler, notify_rx);
+            let client = SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+            transport::initialize(&client).await.unwrap();
+
+            let hub = client.notification_hub().unwrap();
+            let messages = hub.watch_messages();
+            let (events_tx, events_rx) = flume::unbounded();
+
+            let out = transport::call_tool_streaming(
+                &client,
+                "progress",
+                &json!({}),
+                "tool-7",
+                transport::CallRoute::default(),
+                &crate::types::EventSender::new(events_tx, 0),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.text, "done");
+
+            let envelope = events_rx.recv_async().await.unwrap();
+            match envelope.event {
+                crate::AgentEvent::ToolOutput { id, content } => {
+                    assert_eq!(id, "tool-7");
+                    assert!(content.contains("half-way"), "got: {content}");
+                }
+                other => panic!("expected ToolOutput, got {other:?}"),
+            }
+
+            notify_tx.send("note from a plugin".to_string()).unwrap();
+            assert_eq!(messages.recv_async().await.unwrap(), "note from a plugin");
+        });
+    }
+
+    #[test]
+    fn session_and_task_id_reach_the_handler() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = spawn_server(&dir);
+            let client = SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+            transport::initialize(&client).await.unwrap();
+
+            let (events_tx, _events_rx) = flume::unbounded();
+            let out = transport::call_tool_streaming(
+                &client,
+                "whoami",
+                &json!({}),
+                "tool-8",
+                transport::CallRoute {
+                    session_id: Some("sess-1"),
+                    task_id: Some("task-9"),
+                },
+                &crate::types::EventSender::new(events_tx, 0),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.text, "sess-1:task-9");
+
+            let (events_tx, _events_rx) = flume::unbounded();
+            let out = transport::call_tool_streaming(
+                &client,
+                "whoami",
+                &json!({}),
+                "tool-9",
+                transport::CallRoute::default(),
+                &crate::types::EventSender::new(events_tx, 0),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.text, "-:-");
+        });
+    }
+
+    #[test]
+    fn notify_forwarded_as_logging_message() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (tx, rx) = flume::unbounded();
+            let path = spawn_server_notify(&dir, FakeHandler, rx);
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+
+            let init = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25", "capabilities": {} },
+            });
+            let mut buf = serde_json::to_vec(&init).unwrap();
+            buf.push(b'\n');
+            stream.write_all(&buf).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.contains("maki-executor"), "got: {line}");
+
+            tx.send("hello from a plugin".to_string()).unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let note: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(note["method"], "notifications/message");
+            assert_eq!(note["params"]["data"], "hello from a plugin");
         });
     }
 
@@ -499,7 +698,10 @@ mod tests {
             let progress: Value = serde_json::from_str(line.trim()).unwrap();
             assert_eq!(progress["method"], "notifications/progress");
             assert_eq!(progress["params"]["progressToken"], json!(7));
-            assert_eq!(progress["params"]["progress"], json!({ "chunk": "half" }));
+            assert_eq!(
+                progress["params"]["progress"],
+                json!({ "content": "half-way" })
+            );
 
             line.clear();
             reader.read_line(&mut line).await.unwrap();

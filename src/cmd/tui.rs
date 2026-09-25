@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, eyre};
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
@@ -151,8 +151,21 @@ fn build_stack(
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let cli = launch.cli;
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    // Split mode is declared in mcp.toml, a static file, precisely so this
+    // probe can run before the Lua host exists to read init.lua.
+    let executor_mode = cli.executor_socket.is_some() || {
+        let (probe, _) =
+            maki_agent::mcp::config::load_config(launch.cwd, trust.project_config.clone());
+        maki_agent::mcp::executor_socket(&probe).is_some()
+    };
+    let role = if executor_mode {
+        maki_lua::HostRole::Brain
+    } else {
+        maki_lua::HostRole::SingleProcess
+    };
+    let mut plugin_host =
+        PluginHost::with_role(Arc::clone(ToolRegistry::global_arc()), role, !cli.no_jit)
+            .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
     let (config, mut warnings) = super::load_plugins(
@@ -384,14 +397,43 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // cannot pick different sessions, different ids or a different cwd to look
     // in, and all three report the same start to telemetry.
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
+    // Split mode keys sessions on the executor's workspace: the brain's own
+    // cwd may not even exist as a path in the executor's container.
+    let split = maki_agent::mcp::split_declaration(
+        &cwd,
+        &stack.config,
+        &trust.project_config,
+        cli.executor_socket.clone(),
+    );
+    // A broken plugin file is a fatal startup error, same as a broken
+    // init.lua — never a tool that silently never shows up.
+    if let Some((_, push)) = &split {
+        maki_lua::check_plugin_sources(push)
+            .map_err(|e| eyre!("executor plugin failed to parse:\n{e}"))?;
+    }
+    let executor_socket = split.as_ref().map(|(socket, _)| socket.clone());
+    let session_cwd = match &executor_socket {
+        // The probe doubles as the liveness check: split mode without an
+        // executor is a brain with no workspace tools, so it must not boot.
+        Some(path) => maki_agent::mcp::probe_executor_workspace(path).ok_or_else(|| {
+            eyre!(
+                "split mode is on but the executor does not answer at {}; start it first, e.g. `maki serve --socket {}`",
+                path.display(),
+                path.display()
+            )
+        })?,
+        None => cwd_str.clone(),
+    };
+    let resolved = resume::resolve(&cli, &session_cwd, &storage)?;
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
     if cli.is_sdk_mode() {
         let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
+        let executor = split;
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
+            executor,
             cli,
             resumed,
             claim,
@@ -414,7 +456,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if cli.print {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
+        let executor = split;
         crate::print::run(crate::print::PrintParams {
+            executor,
             model: stack.model,
             prompt: cli.initial_prompt,
             image_paths: cli.images,
@@ -440,7 +484,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         resolved,
         &stack.model.spec(),
         cli.model.is_some(),
-        &cwd_str,
+        &session_cwd,
     )];
     let mut focused = 0;
     let mut warnings = startup_warnings;
@@ -459,6 +503,20 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         }
 
+        // The push rebuilds per generation so a reload ships edited plugins;
+        // each build re-parses them, fatal on a syntax error.
+        let split = maki_agent::mcp::split_declaration(
+            &cwd,
+            &stack.config,
+            &trust.project_config,
+            cli.executor_socket.clone(),
+        );
+        if let Some((_, push)) = &split {
+            maki_lua::check_plugin_sources(push)
+                .map_err(|e| eyre!("executor plugin failed to parse:\n{e}"))?;
+        }
+        let executor_socket = split.as_ref().map(|(socket, _)| socket.clone());
+        let executor_push = split.map(|(_, push)| push);
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
                 // The startup default only (`--model`, then last-used, then
@@ -494,6 +552,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
+                executor_push,
+                executor_socket,
             },
             initial_prompt.take(),
         )
@@ -543,7 +603,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 if tabs.is_empty() {
                     let replacement = Resolved::fresh(&storage);
                     setup::report_session_start(replacement.start_type, Some(&replacement.id));
-                    tabs.push(replacement.into_session(&new_stack.model.spec(), &cwd_str));
+                    tabs.push(replacement.into_session(&new_stack.model.spec(), &session_cwd));
                 }
                 stack = new_stack;
                 if let Some(report) = pack_report {

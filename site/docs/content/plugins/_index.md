@@ -21,21 +21,28 @@ Plugins live in the maki config dir. There are two of them, same layout:
 - `<project>/.maki/` - this project only
 
 ```
-init.lua        the only file maki runs; require()s plugins, calls maki.setup()
-lua/<name>.lua  plugin modules, loaded by require("<name>")
-plugin.toml     permission grants for every Lua file in the dir
+init.lua            config only: maki.setup() and requires
+autoload/executor/  tool plugins (LLM-facing), auto-loaded and shipped to the
+                    executor in split mode
+autoload/brain/     UI plugins, auto-loaded: slash commands, keymaps, views
+lua/<name>.lua      shared modules, loaded by require("<name>")
+plugin.toml         permission grants for init.lua and modules under lua/
 ```
 
-Nothing under `lua/` loads on its own. A module name is its path under `lua/`
-without the extension: `lua/browser.lua` is `require("browser")`,
+Everything under `autoload/` loads on its own, sorted by file name. Nothing
+under `lua/` does. A module name is its path under `lua/` without the
+extension: `lua/browser.lua` is `require("browser")`,
 `lua/acme/tools.lua` is `require("acme.tools")`. `require` is sandboxed to
 that directory, you cannot reach files outside it.
 
 ## Creating a plugin
 
-1. Write the code in `~/.config/maki/lua/<name>.lua`. The `maki` global is
-   already there, nothing to import. For a project-only plugin use
-   `<project>/.maki/` here and in every step below.
+1. Write the code in `~/.config/maki/autoload/executor/<name>.lua`. Tool
+   plugins live executor-side: the executor runs them in split mode, and
+   single-process mode loads them the same way. UI-only plugins (commands,
+   keymaps, views) go in `autoload/brain/`. The `maki` global is already
+   there, nothing to import. A project-only plugin keeps the require route:
+   `<project>/.maki/lua/<name>.lua` loaded from `<project>/.maki/init.lua`.
 
 ```lua
 maki.api.register_tool({
@@ -48,14 +55,15 @@ maki.api.register_tool({
 })
 ```
 
-2. Load it from `~/.config/maki/init.lua`, creating that file if missing:
+2. Declare the capabilities it needs in the file's leading comment block.
+   An autoloaded file without the line gets none.
 
 ```lua
-require("hello")
+---@permissions fs_read, run
 ```
 
-3. Grant the permissions it needs in `~/.config/maki/plugin.toml`, creating
-   that file if missing. Without the file every gated call is denied.
+   Only `init.lua` and modules under `lua/` still read
+   `~/.config/maki/plugin.toml`:
 
 ```toml
 [permissions]
@@ -63,7 +71,7 @@ fs_read = true
 run = true
 ```
 
-4. Run `/reload`, then read the log as described below, to see that it loaded
+3. Run `/reload`, then read the log as described below, to see that it loaded
    and what it printed.
 
 Leave `maki.api.register_options` to bundled plugins: maki rejects a
@@ -103,6 +111,7 @@ handling, LLM output truncation, collapsible UI view. It is a bundled plugin,
 so it opens with `register_options`, which your own plugin skips:
 
 ```lua
+local glob_view = require("glob_view")
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
@@ -113,11 +122,6 @@ local NO_FILES_FOUND = "No files found"
 local opts = maki.api.register_options(output_limits.extend({
   search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
 }))
-
-local function glob_view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 3, keep = "head" }
-end
 
 maki.api.register_tool({
   name = "glob",
@@ -148,7 +152,7 @@ maki.api.register_tool({
   end,
 
   restore = function(_input, output, _is_error, ctx)
-    return ToolView.restore(output, glob_view_opts(ctx))
+    return ToolView.restore(output, glob_view.view_opts(ctx))
   end,
 
   handler = function(input, ctx)
@@ -182,19 +186,9 @@ maki.api.register_tool({
     local text = table.concat(lines, "\n")
     local llm_output = truncate(text, max_lines, max_bytes)
 
-    local buf = maki.ui.buf()
-    local view = ToolView.new(buf, glob_view_opts(ctx))
-    for _, line in ipairs(lines) do
-      view:append(line)
-    end
-    view:finish()
-    buf:on("click", function()
-      view:toggle()
-    end)
-
     return {
       llm_output = llm_output,
-      body = buf,
+      body = glob_view.build_from_lines(lines, ctx),
     }
   end,
 })

@@ -94,6 +94,8 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
+const SPLIT_SHELL_DISABLED: &str =
+    "The ! shell is disabled in split mode; run commands on the executor host";
 const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
 const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
 const FLASH_PLAN_FORM_SLOW: &str = "The plugin host was slow, opened the built-in plan form";
@@ -385,6 +387,9 @@ pub struct App {
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
+    /// Brain/executor split: this process is the brain, so the `!` shell and
+    /// workspace file editing live on the executor host and are disabled here.
+    pub(crate) split_mode: bool,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
     pub(crate) model_policy: Arc<ModelPolicy>,
@@ -505,6 +510,7 @@ impl App {
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
+            split_mode: false,
             ui_config,
             permissions,
             model_policy: Arc::clone(&model_policy),
@@ -1450,6 +1456,10 @@ impl App {
         }
 
         if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
+            if self.split_mode {
+                self.flash(SPLIT_SHELL_DISABLED.into());
+                return vec![];
+            }
             let cmd = prefix.command.trim();
             if cmd == "cd" || cmd.starts_with("cd ") {
                 self.flash("Only /cd can change the working directory".into());

@@ -7,7 +7,7 @@ group = "Reference"
 
 # MCP (Model Context Protocol)
 
-Maki connects to external tool servers over MCP. Both **stdio** and **HTTP** transports are supported.
+Maki connects to external tool servers over MCP. **stdio**, **HTTP**, and **unix socket** transports are supported.
 
 ## Configuration
 
@@ -77,11 +77,19 @@ On macOS, Maki uses its own OpenSSL, which does not read the keychain. The bundl
 | `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
 | `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
 | `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
-| `timeout` | u64 | 30000 | Milliseconds (1-300000) |
+| `timeout` | u64 | 30000 | Milliseconds (1-300000). The reserved `executor` server has no request timeout: its tools bound their own runs |
 | `enabled` | bool | true | |
 | `always_load` | bool | false | Skip tool search, load all tools upfront |
 
-Set `command` for stdio, `url` for HTTP. Pick one.
+Set `command` for stdio, `url` for HTTP, `path` for a unix socket. Pick one. A socket
+server looks like this:
+
+```toml
+[mcp.myservice]
+path = "/run/myservice/mcp.sock"
+```
+
+The server name `executor` is reserved for the [brain/executor split](/docs/split-mode/).
 
 One option lives at the top level of `mcp.toml`, outside any server:
 

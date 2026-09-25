@@ -140,6 +140,63 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
 /// costs at scale is not yet known.
 pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
 
+/// Bundled plugins that belong to the brain process in the brain/executor
+/// split: session state, user interaction, and LLM-driven tools. The provider
+/// plugins in [PROVIDER_BUILTINS] are brain-role too — a provider is
+/// constructed where the LLM call is made — and `completion` (optional) as
+/// well. Everything else in DEFAULT_BUILTINS is executor-role.
+pub const BRAIN_ROLE_BUILTINS: &[&str] = &[
+    "batch",
+    "memory",
+    "plan",
+    "question",
+    "sessions",
+    "task",
+    "thinking",
+    "todo_write",
+    "webfetch",
+    "websearch",
+];
+
+/// Brain-role in the brain/executor split: the brain-role builtins, the
+/// provider plugins, and the optional ones (all TUI-side today).
+pub fn is_brain_role_builtin(name: &str) -> bool {
+    BRAIN_ROLE_BUILTINS.contains(&name)
+        || OPTIONAL_BUILTINS.contains(&name)
+        || PROVIDER_BUILTINS.contains(&name)
+}
+
+/// Plugin metadata declared in the file itself, for single-file plugins that
+/// have no plugin.toml to carry it. Scanned statically from the leading
+/// comment block: lines of `---@key value` before the first code line.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PluginAnnotations {
+    pub permissions: Vec<String>,
+}
+
+pub fn parse_plugin_annotations(source: &str) -> PluginAnnotations {
+    let mut out = PluginAnnotations::default();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || (trimmed.starts_with("--") && !trimmed.starts_with("---@")) {
+            continue;
+        }
+        let Some(annotation) = trimmed.strip_prefix("---@") else {
+            break;
+        };
+        if let Some(rest) = annotation.strip_prefix("permissions")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            out.permissions = rest
+                .split(',')
+                .map(|p| p.trim().to_owned())
+                .filter(|p| !p.is_empty())
+                .collect();
+        }
+    }
+    out
+}
+
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a
 /// pointer to the new one.
@@ -4111,6 +4168,60 @@ mod tests {
                 "DEFAULT_BUILTINS not sorted: {:?} >= {:?}",
                 pair[0],
                 pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn parses_plugin_annotations_from_the_leading_comment_block() {
+        let source = "-- my python tool\n-- runs the system interpreter\n\n---@permissions run, fs_read\n\nlocal x = 1\n---@permissions net\n";
+        let annotations = parse_plugin_annotations(source);
+        assert_eq!(annotations.permissions, ["run", "fs_read"]);
+    }
+
+    #[test]
+    fn plugin_annotations_stop_at_code_and_default_when_absent() {
+        assert_eq!(
+            parse_plugin_annotations("local x = 1\n---@permissions run\n"),
+            PluginAnnotations::default(),
+            "annotations after code do not count"
+        );
+        assert_eq!(
+            parse_plugin_annotations("---@permissions\n"),
+            PluginAnnotations {
+                permissions: Vec::new(),
+            },
+            "a bare key parses empty so validation can reject it"
+        );
+    }
+
+    #[test]
+    fn brain_role_builtins_are_sorted_default_builtins() {
+        for pair in BRAIN_ROLE_BUILTINS.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "BRAIN_ROLE_BUILTINS not sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for name in BRAIN_ROLE_BUILTINS {
+            assert!(
+                DEFAULT_BUILTINS.contains(name),
+                "{name} is brain-role but not a default builtin"
+            );
+        }
+    }
+
+    /// Providers are constructed in the brain, so a provider plugin landing
+    /// executor-side leaves its slug unregistered where models are listed and
+    /// LLM calls are made.
+    #[test]
+    fn provider_builtins_are_brain_role() {
+        for name in PROVIDER_BUILTINS {
+            assert!(
+                is_brain_role_builtin(name),
+                "{name} declares a provider but is not brain-role"
             );
         }
     }

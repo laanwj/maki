@@ -1009,6 +1009,8 @@ fn start_event_pump(
                     update
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
+                // View payloads are for registered TUI views; ACP has none.
+                AgentEvent::ToolProgress { .. } => continue,
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::Done { reason, .. } => {

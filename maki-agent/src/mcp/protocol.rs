@@ -88,10 +88,43 @@ pub struct ToolsListResult {
     pub tools: Vec<ToolInfo>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct CallToolContent {
-    #[serde(default)]
-    pub text: String,
+/// MCP content blocks, the standard tagged-union shape: `{ "type": "text",
+/// ... }`, `{ "type": "image", "data": ..., "mimeType": ... }`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CallToolContent {
+    Text {
+        text: String,
+    },
+    Image {
+        /// base64, per the MCP schema.
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    /// A block type maki does not model (audio, resource links): tolerated on
+    /// the wire so an unknown block never fails the call, never rendered.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CallToolContent {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    /// The image block, rebuilt as an [`ImageSource`]. An unviewable type
+    /// (e.g. SVG) is dropped like a text-only answer, not an error.
+    pub fn image(&self) -> Option<maki_providers::ImageSource> {
+        let CallToolContent::Image { data, mime_type } = self else {
+            return None;
+        };
+        let media_type = maki_providers::ImageMediaType::from_mime(mime_type)?;
+        Some(maki_providers::ImageSource::new(
+            media_type,
+            std::sync::Arc::from(data.as_str()),
+        ))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,9 +138,17 @@ impl CallToolResult {
     pub fn joined_text(&self) -> String {
         self.content
             .iter()
-            .map(|c| c.text.as_str())
+            .filter_map(|c| match c {
+                CallToolContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The first viewable image block, if the call returned one.
+    pub fn image(&self) -> Option<maki_providers::ImageSource> {
+        self.content.iter().find_map(|c| c.image())
     }
 }
 
@@ -215,10 +256,37 @@ mod tests {
 
     #[test]
     fn call_tool_result_honours_is_error_rename() {
-        let raw = json!({"content": [{"text": "hello"}], "isError": true});
+        let raw = json!({"content": [{"type": "text", "text": "hello"}], "isError": true});
         let result: CallToolResult = serde_json::from_value(raw).unwrap();
         assert!(result.is_error);
         assert_eq!(result.joined_text(), "hello");
+    }
+
+    #[test]
+    fn call_tool_result_carries_image_blocks() {
+        let raw = json!({"content": [
+            {"type": "text", "text": "[image: shot.png 1KB 8x8]"},
+            {"type": "image", "data": "aGk=", "mimeType": "image/png"},
+        ]});
+        let result: CallToolResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(result.joined_text(), "[image: shot.png 1KB 8x8]");
+        let image = result.image().expect("image block");
+        assert_eq!(image.media_type, maki_providers::ImageMediaType::Png);
+        assert_eq!(&*image.data, "aGk=");
+    }
+
+    /// Unviewable types (svg here) and blocks maki does not model (audio)
+    /// degrade to text instead of failing the call.
+    #[test]
+    fn call_tool_result_tolerates_unknown_and_unviewable_blocks() {
+        let raw = json!({"content": [
+            {"type": "audio", "data": "AAE=", "mimeType": "audio/wav"},
+            {"type": "image", "data": "aGk=", "mimeType": "image/svg+xml"},
+            {"type": "text", "text": "described"},
+        ]});
+        let result: CallToolResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(result.joined_text(), "described");
+        assert!(result.image().is_none(), "svg has no ImageMediaType");
     }
 
     #[test]

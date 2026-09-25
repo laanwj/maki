@@ -113,6 +113,15 @@ local function discover_skills()
     scan_skill_dir(maki.fs.joinpath(config, "skills"), skills)
   end
 
+  -- In the brain/executor split the executor's global skills arrive with the
+  -- handshake (its config dir may not even be mounted) and land here.
+  if maki.fn.has("executor") == 1 then
+    local state = maki.env.state_dir()
+    if state then
+      scan_skill_dir(maki.fs.joinpath(state, "executor", "skills"), skills)
+    end
+  end
+
   local home = maki.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do

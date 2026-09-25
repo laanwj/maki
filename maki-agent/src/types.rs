@@ -640,6 +640,13 @@ pub enum AgentEvent {
         id: String,
         content: String,
     },
+    /// A tool's structured progress payload, for a registered view. Unlike
+    /// `ToolOutput` (display text for the generic UI), the value's shape is
+    /// the tool's own contract with its view.
+    ToolProgress {
+        id: String,
+        payload: serde_json::Value,
+    },
     ToolDone(Box<ToolDoneEvent>),
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {

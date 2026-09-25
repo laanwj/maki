@@ -1,10 +1,11 @@
+local read_view = require("read_view")
 local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
 local helpers = require("read_helpers")
 
 local truncate_bytes = helpers.truncate_bytes
 local split_lines = helpers.split_lines
+local build_file_view = read_view.build_file_view
 
 local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
@@ -26,63 +27,6 @@ local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
 })
-
-local function read_view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.read) or 10, keep = "head" }
-end
-
-local function apply_highlights(view, lines, ext, prefix)
-  local opts = prefix and { prefix = prefix } or nil
-  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext, opts)
-  if not highlighted then
-    return
-  end
-  for i, hl_spans in ipairs(highlighted) do
-    local plain = view.all_lines[i]
-    if not plain then
-      break
-    end
-    view:update_line(i, { plain[1], table.unpack(hl_spans) })
-  end
-  view:flush()
-end
-
-local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, read_view_opts(ctx))
-  local nr_fmt = ToolView.line_nr_fmt(start_line + #lines - 1) .. " "
-
-  for i, line in ipairs(lines) do
-    view:append({ { string.format(nr_fmt, start_line + i - 1), "line_nr" }, { line } })
-  end
-
-  local trunc_start = start_line + #lines
-  if trunc_start <= total_lines then
-    view:append({
-      {
-        string.format(
-          "... Truncated %d lines. Use offset=%d to read further.",
-          total_lines - trunc_start + 1,
-          trunc_start
-        ),
-        "dim",
-      },
-    })
-  end
-
-  view:finish()
-
-  local ext = path:match("%.([^%.]+)$") or ""
-  maki.async.run(function()
-    apply_highlights(view, lines, ext, prefix)
-  end)
-
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
-end
 
 local function read_file(path, offset, limit, ctx)
   local content, err = maki.fs.read(path)
@@ -178,37 +122,12 @@ maki.api.register_tool({
 
   header = function(input)
     local buf = maki.ui.buf()
-    local s = shorten_path(input.path or "")
-    local start = input.offset or 1
-    if input.limit and input.limit > 0 then
-      s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
-    else
-      s = s .. ":" .. start
-    end
-    buf:line({ { s, "path" } })
+    buf:line({ { read_view.summary(input), "path" } })
     return buf
   end,
 
-  restore = function(input, output, _is_error, ctx)
-    local lines, start_line, total_lines = {}, nil, nil
-    for _, raw in ipairs(maki.split(output, "\n")) do
-      local nr, text = raw:match("^%s*(%d+): (.*)$")
-      if nr then
-        start_line = start_line or tonumber(nr)
-        lines[#lines + 1] = text
-      else
-        local trunc_end = raw:match("Truncated lines: %d+%-(%d+)")
-        if trunc_end then
-          total_lines = tonumber(trunc_end)
-        end
-      end
-    end
-    if #lines == 0 then
-      return ToolView.restore(output, read_view_opts(ctx))
-    end
-    start_line = start_line or 1
-    total_lines = total_lines or (start_line + #lines - 1)
-    return build_file_view(lines, start_line, total_lines, input.path or "", ctx)
+  restore = function(input, output, is_error, ctx)
+    return read_view.render_output(input, output, ctx)
   end,
 
   handler = function(input, ctx)

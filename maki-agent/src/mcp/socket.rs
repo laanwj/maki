@@ -15,7 +15,11 @@ pub struct SocketTransport {
 }
 
 impl SocketTransport {
-    pub async fn connect(name: &str, path: &Path, timeout: Duration) -> Result<Self, McpError> {
+    pub async fn connect(
+        name: &str,
+        path: &Path,
+        timeout: Option<Duration>,
+    ) -> Result<Self, McpError> {
         let stream = UnixStream::connect(path)
             .await
             .map_err(|e| McpError::StartFailed {
@@ -61,6 +65,10 @@ impl McpTransport for SocketTransport {
     fn transport_kind(&self) -> &'static str {
         "socket"
     }
+
+    fn notification_hub(&self) -> Option<super::line::NotificationHub> {
+        Some(self.io.hub())
+    }
 }
 
 #[cfg(test)]
@@ -105,7 +113,7 @@ mod tests {
                     stream.flush().await.unwrap();
                 })
             });
-            let transport = SocketTransport::connect("test", &path, TIMEOUT)
+            let transport = SocketTransport::connect("test", &path, Some(TIMEOUT))
                 .await
                 .unwrap();
             let result = transport
@@ -130,7 +138,7 @@ mod tests {
                         .unwrap();
                 })
             });
-            let transport = SocketTransport::connect("test", &path, TIMEOUT)
+            let transport = SocketTransport::connect("test", &path, Some(TIMEOUT))
                 .await
                 .unwrap();
             transport
@@ -140,6 +148,34 @@ mod tests {
             let received = rx.recv().await.unwrap();
             assert_eq!(received["method"], "notifications/initialized");
             assert!(received.get("id").is_none());
+        });
+    }
+
+    fn no_timeout_waits_for_slow_answers() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (path, _listener) = spawn_server(&dir, |mut stream| {
+                smol::spawn(async move {
+                    let mut reader = BufReader::new(stream.clone());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let msg: Value = serde_json::from_str(line.trim()).unwrap();
+                    let id = msg["id"].as_u64().unwrap();
+                    // Past any client timer would do; the point is none exists.
+                    smol::Timer::after(Duration::from_millis(150)).await;
+                    let response = json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}});
+                    let mut buf = serde_json::to_vec(&response).unwrap();
+                    buf.push(b'\n');
+                    stream.write_all(&buf).await.unwrap();
+                    stream.flush().await.unwrap();
+                })
+            });
+            let transport = SocketTransport::connect("test", &path, None).await.unwrap();
+            let result = transport
+                .send_request("tools/list", None)
+                .await
+                .expect("request failed");
+            assert_eq!(result, json!({"ok": true}));
         });
     }
 
@@ -154,9 +190,10 @@ mod tests {
                     std::future::pending::<()>().await;
                 })
             });
-            let transport = SocketTransport::connect("test", &path, Duration::from_millis(100))
-                .await
-                .unwrap();
+            let transport =
+                SocketTransport::connect("test", &path, Some(Duration::from_millis(100)))
+                    .await
+                    .unwrap();
             let result = transport.send_request("tools/list", None).await;
             assert!(matches!(result, Err(McpError::Timeout { .. })));
         });
@@ -172,7 +209,7 @@ mod tests {
                     let _ = reader.read_line(&mut line).await;
                 })
             });
-            let transport = SocketTransport::connect("test", &path, TIMEOUT)
+            let transport = SocketTransport::connect("test", &path, Some(TIMEOUT))
                 .await
                 .unwrap();
             let result = transport.send_request("tools/list", None).await;
@@ -184,6 +221,7 @@ mod tests {
     fn socket_transport() {
         request_response();
         notification_forwarded();
+        no_timeout_waits_for_slow_answers();
         timeout_when_server_silent();
         server_died_on_close();
     }

@@ -426,4 +426,34 @@ case("line_endings_follow_the_majority_when_mixed", function()
   eq(edit_lines("a\r\nb\n", 1, 1, "X"), "X\nb\n")
 end)
 
+-- edit_view: the shapes the brain-side view and the restores share
+
+local edit_view = require("edit_view")
+
+case("view_blocks_edit", function()
+  local blocks = edit_view.blocks_edit({ old_string = "a", new_string = "b" })
+  eq(#blocks, 1)
+  eq(blocks[1].old, "a")
+  eq(blocks[1].new, "b")
+end)
+
+case("view_blocks_multiedit", function()
+  local blocks = edit_view.blocks_multiedit({
+    edits = { { old_string = "a", new_string = "b" }, { old_string = "c" } },
+  })
+  eq(#blocks, 2)
+  eq(blocks[2].old, "c")
+  eq(blocks[2].new, nil)
+end)
+
+case("view_blocks_edit_lines_carries_the_start_line", function()
+  local blocks = edit_view.blocks_edit_lines({ new_string = "x", start = 7 })
+  eq(blocks[1].nr, 7)
+end)
+
+case("view_blocks_insert_lines_offsets_the_line", function()
+  local blocks = edit_view.blocks_insert_lines({ new_string = "x", line = 4 })
+  eq(blocks[1].nr, 5)
+end)
+
 th.report()

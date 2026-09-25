@@ -1,3 +1,4 @@
+local glob_view = require("glob_view")
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
@@ -8,11 +9,6 @@ local NO_FILES_FOUND = "No files found"
 local opts = maki.api.register_options(output_limits.extend({
   search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
 }))
-
-local function glob_view_opts(ctx)
-  local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 3, keep = "head" }
-end
 
 maki.api.register_tool({
   name = "glob",
@@ -43,7 +39,7 @@ maki.api.register_tool({
   end,
 
   restore = function(_input, output, _is_error, ctx)
-    return ToolView.restore(output, glob_view_opts(ctx))
+    return ToolView.restore(output, glob_view.view_opts(ctx))
   end,
 
   handler = function(input, ctx)
@@ -77,19 +73,9 @@ maki.api.register_tool({
     local text = table.concat(lines, "\n")
     local llm_output = truncate(text, max_lines, max_bytes)
 
-    local buf = maki.ui.buf()
-    local view = ToolView.new(buf, glob_view_opts(ctx))
-    for _, line in ipairs(lines) do
-      view:append(line)
-    end
-    view:finish()
-    buf:on("click", function()
-      view:toggle()
-    end)
-
     return {
       llm_output = llm_output,
-      body = buf,
+      body = glob_view.build_from_lines(lines, ctx),
     }
   end,
 })

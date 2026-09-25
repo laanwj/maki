@@ -30,6 +30,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/plugins/"><span class="card-title">Plugins</span><span class="card-desc">Add your own tools and commands in Lua, or let the agent write them.</span></a>
     <a class="card" href="/docs/headless/"><span class="card-title">Headless Mode</span><span class="card-desc">--print for scripts and CI. Drop-in Claude Code compatible.</span></a>
     <a class="card" href="/docs/acp/"><span class="card-title">ACP</span><span class="card-desc">Drive Maki from your editor, like Zed, over the Agent Client Protocol.</span></a>
+    <a class="card" href="/docs/split-mode/"><span class="card-title">Brain/Executor Split</span><span class="card-desc">Run tools in an executor process that never sees your keys.</span></a>
   </div>
 </div>
 

@@ -21,7 +21,9 @@ pub mod http;
 pub mod line;
 pub mod oauth;
 pub mod protocol;
+pub mod push;
 pub mod server;
+#[cfg(unix)]
 pub mod socket;
 pub mod stdio;
 pub mod transport;
@@ -40,11 +42,12 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use self::config::{
-    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, RawServerConfig, RawTransport,
-    ServerConfig, Transport, load_config, parse_server, transport_kind,
+    McpConfig, McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus, RawServerConfig,
+    RawTransport, ServerConfig, Transport, load_config, parse_server, transport_kind,
 };
 use self::error::McpError;
 use self::http::HttpTransport;
+#[cfg(unix)]
 use self::socket::SocketTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
@@ -182,7 +185,13 @@ impl ServerEntry {
                 true
             })
             .map(|info| McpToolDef {
-                qualified_name: intern(format!("{}{SEPARATOR}{}", self.name, info.name)),
+                // The executor is not "a server": it IS the tool surface. Its
+                // tools keep their bare names so split mode renames nothing.
+                qualified_name: intern(if self.name == config::EXECUTOR_SERVER_NAME {
+                    info.name.clone()
+                } else {
+                    format!("{}{SEPARATOR}{}", self.name, info.name)
+                }),
                 raw_name: info.name,
                 description: info.description,
                 input_schema: info.input_schema,
@@ -553,7 +562,11 @@ impl McpHandle {
         })
     }
 
-    pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
+    pub async fn call_tool(
+        &self,
+        qualified_name: &str,
+        args: &Value,
+    ) -> Result<transport::McpCallOutput, McpError> {
         let (raw_name, transport) = {
             let idx = self.index.load();
             let Some(t) = idx.tools.get(qualified_name) else {
@@ -591,6 +604,65 @@ impl McpHandle {
             .ok_or_else(|| McpError::UnknownServer {
                 name: server.into(),
             })
+    }
+
+    /// tools/call with progress streaming: progress notifications arrive as
+    /// ToolOutput events for `tool_id` on transports that support it.
+    /// `route` names the chat (and subagent task) being served.
+    pub async fn call_tool_streaming(
+        &self,
+        qualified_name: &str,
+        args: &Value,
+        tool_id: &str,
+        route: transport::CallRoute<'_>,
+        events: &crate::types::EventSender,
+        payloads: Option<flume::Sender<Value>>,
+    ) -> Result<transport::McpCallOutput, McpError> {
+        let (raw_name, transport) = {
+            let idx = self.index.load();
+            let Some(t) = idx.tools.get(qualified_name) else {
+                return Err(McpError::UnknownTool {
+                    name: qualified_name.into(),
+                });
+            };
+            (t.raw_name.clone(), Arc::clone(&t.transport))
+        };
+        transport::call_tool_streaming(
+            transport.as_ref(),
+            &raw_name,
+            args,
+            tool_id,
+            route,
+            events,
+            payloads,
+        )
+        .await
+    }
+
+    /// Qualified tool infos (`server.tool`) for re-export: the executor serves
+    /// its downstream MCP servers' tools under those names.
+    pub fn tool_infos(&self) -> Vec<protocol::ToolInfo> {
+        let idx = self.index.load();
+        idx.descriptors
+            .iter()
+            .map(|d| protocol::ToolInfo {
+                name: d.qualified_name.to_string(),
+                description: d.definition["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                input_schema: d.definition["input_schema"].clone(),
+            })
+            .collect()
+    }
+
+    /// Subscribe to a server's log messages (executor plugin notifications).
+    pub fn watch_messages(&self, server: &str) -> Option<flume::Receiver<String>> {
+        let idx = self.index.load();
+        idx.transports
+            .get(server)
+            .and_then(|t| t.notification_hub())
+            .map(|hub| hub.watch_messages())
     }
 
     pub async fn list_resources(
@@ -665,6 +737,168 @@ pub async fn start_connected(
         handle.ready().await;
     }
     (handle, config_errors)
+}
+
+/// Whether the split is declared (flag, env, or mcp.toml), and if so the
+/// push to ride the executor's handshake. Entry points that boot once compute
+/// this one time up front.
+pub fn split_declaration(
+    cwd: &Path,
+    config: &maki_config::Config,
+    project_config: &ProjectConfig,
+    cli_socket: Option<PathBuf>,
+) -> Option<(PathBuf, push::ExecutorPush)> {
+    let (probe, _) = load_config(cwd, project_config.clone());
+    let socket = executor_socket_path(cli_socket, &probe)?;
+    Some((
+        socket,
+        push::build(config, &probe, project_config.is_trusted()),
+    ))
+}
+
+/// `start_connected` with the TUI's split wiring: a declared executor means
+/// brain mode — config push, liveness gate, and every server's tools up
+/// front. An unreachable executor is fatal, as in the TUI.
+pub async fn start_connected_split(
+    cwd: &Path,
+    project_config: ProjectConfig,
+    split: Option<(PathBuf, push::ExecutorPush)>,
+) -> Result<(Option<McpHandle>, McpConfigErrors), String> {
+    match split {
+        Some((socket, push)) => {
+            let (handle, errors) = start_brain(cwd, project_config, Some(push), Some(socket)).await;
+            let Some(handle) = handle else {
+                return Err("split mode is on but the executor is not configured".into());
+            };
+            executor_ready(&handle, Duration::from_secs(15)).await?;
+            handle.ready().await;
+            Ok((Some(handle), errors))
+        }
+        None => Ok(start_connected(cwd, project_config).await),
+    }
+}
+
+/// The executor's socket path when the config declares the split: an enabled
+/// server named `executor` with a socket path.
+pub fn executor_socket(config: &McpConfig) -> Option<PathBuf> {
+    let entry = config.mcp.get(config::EXECUTOR_SERVER_NAME)?;
+    if !entry.enabled {
+        return None;
+    }
+    match &entry.transport {
+        RawTransport::Socket(fields) => Some(fields.path.clone()),
+        _ => None,
+    }
+}
+
+/// The executor's socket path from all the places it can come from. The
+/// explicit per-invocation override (--executor-socket / MAKI_EXECUTOR_SOCKET)
+/// wins over the reserved mcp.toml entry, which is the fallback.
+pub fn executor_socket_path(override_path: Option<PathBuf>, config: &McpConfig) -> Option<PathBuf> {
+    override_path.or_else(|| executor_socket(config))
+}
+
+/// Ask the executor for its workspace root over the `maki/workspace` probe
+/// request. The brain keys sessions on this: its own cwd may not even exist
+/// as a path in the executor's container.
+#[cfg(unix)]
+pub fn probe_executor_workspace(path: &Path) -> Option<String> {
+    smol::block_on(async {
+        let transport =
+            socket::SocketTransport::connect("executor-probe", path, Some(Duration::from_secs(5)))
+                .await
+                .ok()?;
+        let result = transport.send_request("maki/workspace", None).await.ok()?;
+        transport.shutdown().await;
+        result.as_str().map(str::to_owned)
+    })
+}
+
+#[cfg(not(unix))]
+pub fn probe_executor_workspace(_path: &Path) -> Option<String> {
+    None
+}
+
+/// A terminal answer for the executor connection: Running, or why not. Split
+/// mode without a live executor is fatal, and this is how the brain asks.
+pub async fn executor_ready(handle: &McpHandle, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let snapshot = handle.reader().load_full();
+        let entry = snapshot
+            .infos
+            .iter()
+            .find(|info| info.name == config::EXECUTOR_SERVER_NAME);
+        match entry.map(|info| &info.status) {
+            Some(McpServerStatus::Running) => return Ok(()),
+            Some(McpServerStatus::Failed(reason)) => return Err(reason.clone()),
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out connecting to the executor".into());
+        }
+        smol::Timer::after(Duration::from_millis(50)).await;
+    }
+}
+
+/// Brain-half startup for the split: stdio servers move to the executor (the
+/// brain filter notes the delegation), and the reserved `executor` entry must
+/// be a socket server. `push` rides the executor's initialize handshake.
+pub async fn start_brain(
+    cwd: &Path,
+    project_config: ProjectConfig,
+    push: Option<push::ExecutorPush>,
+    socket_override: Option<PathBuf>,
+) -> (Option<McpHandle>, McpConfigErrors) {
+    let cwd = cwd.to_owned();
+    let (mut config, mut errors) = smol::unblock(move || load_config(&cwd, project_config)).await;
+    // The override declares the executor without touching any config file.
+    if let Some(path) = socket_override
+        && !config.mcp.contains_key(config::EXECUTOR_SERVER_NAME)
+    {
+        config.mcp.insert(
+            config::EXECUTOR_SERVER_NAME.into(),
+            RawServerConfig::runtime(RawTransport::Socket(config::RawSocketFields { path })),
+        );
+    }
+    brain_filter(&mut config, &mut errors);
+    if let Some(push) = push
+        && config.mcp.contains_key(config::EXECUTOR_SERVER_NAME)
+    {
+        config.init_extras.insert(
+            config::EXECUTOR_SERVER_NAME.into(),
+            json!({ "executorConfig": push }),
+        );
+    }
+    (start_with_config(config), errors)
+}
+
+fn brain_filter(config: &mut McpConfig, errors: &mut McpConfigErrors) {
+    let stdio: Vec<String> = config
+        .mcp
+        .iter()
+        .filter(|(_, entry)| matches!(entry.transport, RawTransport::Stdio(_)))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !stdio.is_empty() {
+        for name in &stdio {
+            config.mcp.remove(name);
+        }
+        errors.add_error(McpConfigError::BrainStdio {
+            servers: stdio.join(", "),
+        });
+    }
+    if let Some(entry) = config.mcp.get(config::EXECUTOR_SERVER_NAME)
+        && !matches!(entry.transport, RawTransport::Socket(_))
+    {
+        config.mcp.remove(config::EXECUTOR_SERVER_NAME);
+        errors.add_error(McpConfigError::ExecutorNotSocket);
+    }
+    if let Some(entry) = config.mcp.get_mut(config::EXECUTOR_SERVER_NAME) {
+        // The executor is the core toolset, not an optional extra server:
+        // its tools load upfront rather than behind tool_search.
+        entry.always_load = true;
+    }
 }
 
 /// `start` plus servers declared at runtime. `mcp.toml` wins on name, so a
@@ -946,11 +1180,20 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             maki_storage::StateDir::resolve().ok(),
             ca_file.as_deref(),
         )?),
+        #[cfg(unix)]
         Transport::Socket { path } => {
             Arc::new(SocketTransport::connect(&config.name, path, config.timeout).await?)
         }
+        #[cfg(not(unix))]
+        Transport::Socket { .. } => {
+            return Err(McpError::Config(format!(
+                "server '{}' uses a socket transport, which is only supported on unix",
+                config.name
+            )));
+        }
     };
-    let capabilities = transport::initialize(transport.as_ref()).await?;
+    let capabilities =
+        transport::initialize_with(transport.as_ref(), config.init_extra.clone()).await?;
     // Asymmetric on purpose: sloppy servers omit `capabilities` yet serve
     // tools/list fine, so always ask (fatal only when tools were declared).
     // Prompts only when declared: undeclared endpoints may answer junk,
@@ -985,13 +1228,21 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
     let origins = config.origins;
     let mut entries = Vec::with_capacity(config.mcp.len());
 
+    let init_extras = config.init_extras;
     for (name, raw) in config.mcp {
         let transport_kind = transport_kind(&raw.transport);
         let origin = origins.get(&name).cloned().unwrap_or_default();
         let disabled = !raw.enabled;
+        let init_extra = init_extras.get(&name).cloned();
         let (config, status) = match parse_server(name.clone(), raw, &origin) {
-            Ok(sc) if disabled => (Some(sc), McpServerStatus::Disabled),
-            Ok(sc) => (Some(sc), McpServerStatus::Connecting),
+            Ok(mut sc) => {
+                sc.init_extra = init_extra;
+                if disabled {
+                    (Some(sc), McpServerStatus::Disabled)
+                } else {
+                    (Some(sc), McpServerStatus::Connecting)
+                }
+            }
             Err(e) => {
                 warn!(server = %name, error = %e, "invalid MCP server config");
                 (None, McpServerStatus::Failed(e.to_string()))
@@ -1165,13 +1416,22 @@ pub mod test_support {
     /// Goes through the real `publish` path, so it cannot drift from how the
     /// index is built in production. Tools are named `server.tool`.
     pub fn stub_session(tools: &[(&str, &str)]) -> McpSession {
+        session_with_transport(tools, Arc::new(StubTransport(Arc::from("stub"))))
+    }
+
+    /// `stub_session` over a caller's transport, for tests that drive the
+    /// connection themselves.
+    pub fn session_with_transport(
+        tools: &[(&str, &str)],
+        transport: Arc<dyn McpTransport>,
+    ) -> McpSession {
         let entry = ServerEntry {
             name: "stub".into(),
             config: None,
             transport_kind: "stub",
             origin: PathBuf::new(),
             status: McpServerStatus::Running,
-            transport: Some(Arc::new(StubTransport(Arc::from("stub")))),
+            transport: Some(transport),
             tools: tools
                 .iter()
                 .map(|(qualified, description)| McpToolDef {
@@ -1485,6 +1745,405 @@ mod tests {
         });
     }
 
+    fn split_config(toml_str: &str) -> McpConfig {
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn brain_filter_drops_stdio_servers_loudly() {
+        let mut config = split_config(
+            r#"
+[mcp.executor]
+path = "/run/maki/exec.sock"
+[mcp.local]
+command = ["run-me"]
+[mcp.remote]
+url = "https://mcp.example.com/mcp"
+"#,
+        );
+        let mut errors = McpConfigErrors::new(PathBuf::from("/cwd"));
+        brain_filter(&mut config, &mut errors);
+        assert!(config.mcp.contains_key("executor"));
+        assert!(config.mcp.contains_key("remote"));
+        assert!(!config.mcp.contains_key("local"));
+        let shown = errors.to_string();
+        assert!(shown.contains("local"), "got: {shown}");
+        assert!(shown.contains("executor in split mode"), "got: {shown}");
+    }
+
+    #[test]
+    fn brain_filter_rejects_a_non_socket_executor() {
+        let mut config = split_config(
+            r#"
+[mcp.executor]
+url = "https://mcp.example.com/mcp"
+"#,
+        );
+        let mut errors = McpConfigErrors::new(PathBuf::from("/cwd"));
+        brain_filter(&mut config, &mut errors);
+        assert!(!config.mcp.contains_key("executor"));
+        assert!(errors.to_string().contains("reserved"), "got: {errors}");
+    }
+
+    #[test]
+    fn brain_mode_loads_executor_tools_upfront() {
+        let mut config = split_config("[mcp.executor]\npath = \"/e.sock\"\n");
+        let mut errors = McpConfigErrors::new(PathBuf::from("/cwd"));
+        brain_filter(&mut config, &mut errors);
+        assert!(config.mcp["executor"].always_load);
+    }
+
+    struct DummyTransport;
+
+    impl McpTransport for DummyTransport {
+        fn send_request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> transport::BoxFuture<'a, Result<(), McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown<'a>(&'a self) -> transport::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn server_name(&self) -> &Arc<str> {
+            static NAME: OnceLock<Arc<str>> = OnceLock::new();
+            NAME.get_or_init(|| Arc::from("dummy"))
+        }
+        fn transport_kind(&self) -> &'static str {
+            "dummy"
+        }
+    }
+
+    fn bare_entry(server: &str) -> ServerEntry {
+        ServerEntry {
+            name: server.into(),
+            config: None,
+            transport_kind: "dummy",
+            origin: PathBuf::new(),
+            status: McpServerStatus::Running,
+            transport: None,
+            tools: Vec::new(),
+            prompts: Vec::new(),
+        }
+    }
+
+    fn populate_with(entry: &mut ServerEntry, tool_name: &str) {
+        entry.populate(StartResult {
+            transport: Arc::new(DummyTransport),
+            tool_infos: vec![protocol::ToolInfo {
+                name: tool_name.into(),
+                description: "d".into(),
+                input_schema: json!({}),
+            }],
+            prompt_infos: vec![],
+        });
+    }
+
+    #[test]
+    fn executor_tools_keep_bare_names() {
+        let mut entry = bare_entry(config::EXECUTOR_SERVER_NAME);
+        populate_with(&mut entry, "read");
+        assert_eq!(&*entry.tools[0].qualified_name, "read");
+
+        let mut entry = bare_entry("other");
+        populate_with(&mut entry, "read");
+        assert_eq!(&*entry.tools[0].qualified_name, "other.read");
+    }
+
+    #[test]
+    fn executor_socket_override_wins_over_config() {
+        let config = split_config("[mcp.executor]\npath = \"/from/config.sock\"\n");
+        assert_eq!(
+            executor_socket_path(Some(PathBuf::from("/from/cli.sock")), &config),
+            Some(PathBuf::from("/from/cli.sock"))
+        );
+        assert_eq!(
+            executor_socket_path(None, &config),
+            Some(PathBuf::from("/from/config.sock"))
+        );
+        let empty = split_config("");
+        assert_eq!(executor_socket_path(None, &empty), None);
+    }
+
+    #[cfg(unix)]
+    struct NoopHandler;
+
+    #[cfg(unix)]
+    impl server::ServerHandler for NoopHandler {
+        fn initialize<'a>(
+            &'a self,
+            _params: Value,
+        ) -> transport::BoxFuture<'a, Result<Value, String>> {
+            Box::pin(async { Ok(json!({})) })
+        }
+        fn tools(&self) -> Vec<protocol::ToolInfo> {
+            vec![]
+        }
+        fn resources(&self) -> Vec<protocol::ResourceInfo> {
+            vec![]
+        }
+        fn read_resource(&self, _uri: &str) -> Result<Vec<protocol::ResourceContent>, String> {
+            Ok(vec![])
+        }
+        fn call_tool<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: Value,
+            _session_id: Option<String>,
+            _task_id: Option<String>,
+            _progress: server::ProgressSink,
+            _cancel: crate::cancel::CancelToken,
+        ) -> transport::BoxFuture<'a, Result<protocol::CallToolResult, String>> {
+            Box::pin(async { Err("no tools".into()) })
+        }
+        fn workspace(&self) -> String {
+            "/ws".into()
+        }
+    }
+
+    #[cfg(unix)]
+    struct ProgressHandler;
+
+    #[cfg(unix)]
+    impl server::ServerHandler for ProgressHandler {
+        fn initialize<'a>(
+            &'a self,
+            _params: Value,
+        ) -> transport::BoxFuture<'a, Result<Value, String>> {
+            Box::pin(async { Ok(json!({})) })
+        }
+        fn tools(&self) -> Vec<protocol::ToolInfo> {
+            vec![protocol::ToolInfo {
+                name: "prog".into(),
+                description: "d".into(),
+                input_schema: json!({ "type": "object" }),
+            }]
+        }
+        fn resources(&self) -> Vec<protocol::ResourceInfo> {
+            vec![]
+        }
+        fn read_resource(&self, _uri: &str) -> Result<Vec<protocol::ResourceContent>, String> {
+            Ok(vec![])
+        }
+        fn call_tool<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: Value,
+            _session_id: Option<String>,
+            _task_id: Option<String>,
+            progress: server::ProgressSink,
+            _cancel: crate::cancel::CancelToken,
+        ) -> transport::BoxFuture<'a, Result<protocol::CallToolResult, String>> {
+            Box::pin(async move {
+                progress.send(json!({ "id": "x", "payload": "one" })).await;
+                progress.send(json!({ "id": "x", "payload": "two" })).await;
+                Ok(protocol::CallToolResult {
+                    content: vec![protocol::CallToolContent::text("done")],
+                    is_error: false,
+                })
+            })
+        }
+        fn workspace(&self) -> String {
+            "/ws".into()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn view_progress_payloads_arrive_and_wake_the_ui_channel() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("e.sock");
+            let listener = async_net::unix::UnixListener::bind(&path).unwrap();
+            smol::spawn(server::serve_unix(
+                listener,
+                Arc::new(ProgressHandler),
+                flume::unbounded().1,
+            ))
+            .detach();
+
+            let mut config = McpConfig::default();
+            config.mcp.insert(
+                config::EXECUTOR_SERVER_NAME.into(),
+                RawServerConfig::runtime(RawTransport::Socket(config::RawSocketFields {
+                    path: path.clone(),
+                })),
+            );
+            let handle = start_with_config(config).unwrap();
+            handle.ready().await;
+
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(tx, 0);
+            let mut ctx = crate::tools::test_support::stub_ctx_with(
+                &crate::AgentMode::Build,
+                Some(&event_tx),
+                None,
+            );
+            ctx.mcp = Some(McpSession::new(handle, &[]));
+
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen2 = Arc::clone(&seen);
+            ctx.registry.set_view(
+                "prog",
+                crate::tools::ViewHook {
+                    start: Arc::new(|_| Box::pin(async { None })),
+                    progress: Arc::new(move |_, payload| {
+                        seen2.lock().unwrap().push(payload);
+                        Box::pin(async {})
+                    }),
+                    done: Arc::new(|_| Box::pin(async {})),
+                },
+            );
+
+            let done = crate::agent::tool_dispatch::run(
+                "c1".into(),
+                "prog",
+                &json!({}),
+                &ctx,
+                crate::tools::CallOrigin::Model,
+            )
+            .await;
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            assert_eq!(*seen.lock().unwrap(), vec![json!("one"), json!("two")]);
+            let wakes = rx
+                .try_iter()
+                .filter(|e| matches!(e.event, crate::AgentEvent::ToolProgress { .. }))
+                .count();
+            assert_eq!(wakes, 2, "each payload must wake the UI once");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_ready_answers_running_or_failure() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("e.sock");
+            let listener = async_net::unix::UnixListener::bind(&path).unwrap();
+            smol::spawn(server::serve_unix(
+                listener,
+                Arc::new(NoopHandler),
+                flume::unbounded().1,
+            ))
+            .detach();
+
+            let mut config = McpConfig::default();
+            config.mcp.insert(
+                config::EXECUTOR_SERVER_NAME.into(),
+                RawServerConfig::runtime(RawTransport::Socket(config::RawSocketFields {
+                    path: path.clone(),
+                })),
+            );
+            let handle = start_with_config(config).unwrap();
+            executor_ready(&handle, Duration::from_secs(10))
+                .await
+                .unwrap();
+
+            let mut dead = McpConfig::default();
+            dead.mcp.insert(
+                config::EXECUTOR_SERVER_NAME.into(),
+                RawServerConfig::runtime(RawTransport::Socket(config::RawSocketFields {
+                    path: dir.path().join("dead.sock"),
+                })),
+            );
+            let handle = start_with_config(dead).unwrap();
+            let err = executor_ready(&handle, Duration::from_millis(300))
+                .await
+                .unwrap_err();
+            assert!(err.contains("executor"), "got: {err}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_connected_split_pushes_config_and_waits() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("e.sock");
+            let listener = async_net::unix::UnixListener::bind(&path).unwrap();
+            smol::spawn(server::serve_unix(
+                listener,
+                Arc::new(NoopHandler),
+                flume::unbounded().1,
+            ))
+            .detach();
+
+            let config = maki_config::RawConfig::default().into_config(&[]).unwrap();
+            let (socket, push) = split_declaration(
+                dir.path(),
+                &config,
+                &ProjectConfig::for_project(dir.path()),
+                Some(path.clone()),
+            )
+            .expect("split declared via the override");
+            assert_eq!(socket, path);
+            let builtins = push.builtin_plugins.as_ref().unwrap();
+            assert!(builtins.iter().any(|n| n == "read"));
+            assert!(!builtins.iter().any(|n| n == "task"));
+
+            let (handle, _errors) = start_connected_split(
+                dir.path(),
+                ProjectConfig::for_project(dir.path()),
+                Some((socket, push)),
+            )
+            .await
+            .unwrap();
+            let handle = handle.unwrap();
+            let snapshot = handle.reader().load_full();
+            let info = snapshot
+                .infos
+                .iter()
+                .find(|i| i.name == config::EXECUTOR_SERVER_NAME)
+                .unwrap();
+            assert!(
+                matches!(info.status, McpServerStatus::Running),
+                "got: {:?}",
+                info.status
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_connected_split_fails_loudly_without_a_live_executor() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let result = start_connected_split(
+                dir.path(),
+                ProjectConfig::for_project(dir.path()),
+                Some((dir.path().join("dead.sock"), push::ExecutorPush::default())),
+            )
+            .await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn executor_socket_only_for_an_enabled_socket_entry() {
+        let config = split_config("[mcp.executor]\npath = \"/run/maki/e.sock\"\n");
+        assert_eq!(
+            executor_socket(&config),
+            Some(PathBuf::from("/run/maki/e.sock"))
+        );
+
+        let disabled = split_config("[mcp.executor]\nenabled = false\npath = \"/x.sock\"\n");
+        assert_eq!(executor_socket(&disabled), None);
+
+        let http = split_config("[mcp.executor]\nurl = \"https://x.example.com\"\n");
+        assert_eq!(executor_socket(&http), None);
+
+        let none = split_config("");
+        assert_eq!(executor_socket(&none), None);
+    }
+
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
             enabled: true,
@@ -1599,8 +2258,9 @@ mod tests {
     fn bad_stdio_config(name: &str) -> ServerConfig {
         ServerConfig {
             name: name.into(),
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             always_load: false,
+            init_extra: None,
             transport: Transport::Stdio {
                 program: MISSING_PROGRAM.into(),
                 args: vec![],

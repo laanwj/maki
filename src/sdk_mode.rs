@@ -444,6 +444,9 @@ impl SdkWriter {
 
 pub struct SdkParams {
     pub cli: Cli,
+    /// Split-mode declaration: the executor's socket and the push to send
+    /// it. Resolved by the caller from the same flags every entry point reads.
+    pub executor: Option<(std::path::PathBuf, maki_agent::mcp::push::ExecutorPush)>,
     /// Which session this run continues and writes under, and where. Resolved
     /// by the caller from the same flags every other entry point reads.
     pub resumed: Resumed,
@@ -541,6 +544,7 @@ struct Shared {
 pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
+        executor,
         resumed,
         claim,
         storage,
@@ -564,8 +568,12 @@ pub fn run(params: SdkParams) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
 
-    let (mcp_handle, mcp_config_errors) =
-        smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_connected_split(
+        &cwd,
+        project_config.clone(),
+        executor,
+    ))
+    .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -1051,6 +1059,7 @@ impl EventPump {
             }
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolProgress { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained

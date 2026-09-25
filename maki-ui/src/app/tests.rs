@@ -3474,6 +3474,21 @@ fn submit_exit_quits() {
 }
 
 #[test]
+fn split_mode_disables_the_shell_prefix() {
+    let mut app = test_app();
+    app.split_mode = true;
+    let actions = app.handle_submit(Submission {
+        text: "!ls".into(),
+        images: vec![],
+    });
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(crate::app::SPLIT_SHELL_DISABLED)
+    );
+}
+
+#[test]
 fn a_tab_stays_blank_until_the_user_touches_it() {
     let mut app = test_app();
     app.checkpoint();

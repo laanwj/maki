@@ -143,6 +143,15 @@ maki --no-jit acp
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
 
+### `maki serve`
+
+```bash
+maki serve --socket /run/maki-split/executor.sock
+maki serve --socket /run/maki-split/executor.sock --workspace /path/to/project
+```
+
+Runs the executor half of the [brain/executor split](/docs/split-mode/): the environment tools over MCP on a unix socket. Unix only.
+
 ### `maki index`
 
 ```bash

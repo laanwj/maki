@@ -156,6 +156,9 @@ pub struct PrintParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
+    /// Split-mode declaration: the executor's socket and the push to send
+    /// it. Resolved by the caller from the same flags every entry point reads.
+    pub executor: Option<(std::path::PathBuf, maki_agent::mcp::push::ExecutorPush)>,
     /// Which session this run continues and writes under, and where. Resolved
     /// by the caller from the same flags every other entry point reads.
     pub resumed: Resumed,
@@ -180,6 +183,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         model_policy,
         plugin_rules,
         project_config,
+        executor,
         resumed,
         claim,
         storage,
@@ -199,10 +203,12 @@ pub fn run(params: PrintParams) -> Result<()> {
     let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(
+    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected_split(
         &cwd,
         project_config.clone(),
-    ));
+        executor,
+    ))
+    .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -304,6 +310,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             AgentEvent::ToolPending { .. }
             | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolProgress { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained

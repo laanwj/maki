@@ -127,11 +127,18 @@ pub async fn read_resource(
     Ok(parsed.contents)
 }
 
+/// The text and optional vision content returned by a tools/call.
+#[derive(Debug)]
+pub struct McpCallOutput {
+    pub text: String,
+    pub image: Option<maki_providers::ImageSource>,
+}
+
 pub async fn call_tool(
     transport: &dyn McpTransport,
     tool_name: &str,
     args: &Value,
-) -> Result<String, McpError> {
+) -> Result<McpCallOutput, McpError> {
     let server = &**transport.server_name();
     let start = Instant::now();
     let params = serde_json::json!({
@@ -156,9 +163,13 @@ pub async fn call_tool(
         server,
         tool = tool_name,
         duration_ms = start.elapsed().as_millis() as u64,
+        has_image = call_result.image().is_some(),
         "MCP tools/call response"
     );
-    Ok(text)
+    Ok(McpCallOutput {
+        text,
+        image: call_result.image(),
+    })
 }
 
 #[cfg(test)]

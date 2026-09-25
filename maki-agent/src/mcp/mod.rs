@@ -666,7 +666,11 @@ impl McpHandle {
         })
     }
 
-    pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
+    pub async fn call_tool(
+        &self,
+        qualified_name: &str,
+        args: &Value,
+    ) -> Result<transport::McpCallOutput, McpError> {
         let (raw_name, transport) = {
             let idx = self.index.load();
             let Some(t) = idx.tools.get(qualified_name) else {
@@ -1278,13 +1282,22 @@ pub mod test_support {
     /// Goes through the real `publish` path, so it cannot drift from how the
     /// index is built in production. Tools are named `server.tool`.
     pub fn stub_session(tools: &[(&str, &str)]) -> McpSession {
+        session_with_transport(tools, Arc::new(StubTransport(Arc::from("stub"))))
+    }
+
+    /// `stub_session` over a caller's transport, for tests that drive the
+    /// connection themselves.
+    pub fn session_with_transport(
+        tools: &[(&str, &str)],
+        transport: Arc<dyn McpTransport>,
+    ) -> McpSession {
         let entry = ServerEntry {
             name: "stub".into(),
             config: None,
             transport_kind: "stub",
             origin: PathBuf::new(),
             status: McpServerStatus::Running,
-            transport: Some(Arc::new(StubTransport(Arc::from("stub")))),
+            transport: Some(transport),
             tools: tools
                 .iter()
                 .map(|(qualified, description)| McpToolDef {

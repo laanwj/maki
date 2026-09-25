@@ -1045,37 +1045,51 @@ async fn execute_mcp_tool(
 ) -> ToolDoneEvent {
     let view = RoutedView::mcp(&tool);
     emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
-    let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
-        call: None,
-        id: id.to_owned(),
-        tool: Arc::clone(&tool),
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
+    let done = |output: TextOutput, image: Option<maki_providers::ImageSource>, is_error: bool| {
+        let output = match image {
+            Some(source) => ToolOutput::Image {
+                source,
+                text: output.text,
+            },
+            None => view.output(output),
+        };
+        ToolDoneEvent {
+            call: None,
+            id: id.to_owned(),
+            tool: Arc::clone(&tool),
+            output: Arc::new(output),
+            is_error,
+            annotation: None,
+            written_path: None,
+        }
     };
 
     let perm_tool = match ToolKey::parse(&tool) {
         Ok(k) => k,
         Err(e) => {
-            return done(format!("invalid MCP tool key '{tool}': {e}").into(), true);
+            return done(
+                format!("invalid MCP tool key '{tool}': {e}").into(),
+                None,
+                true,
+            );
         }
     };
     if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask, hook).await {
-        return done(e.into(), true);
+        return done(e.into(), None, true);
     }
 
     // Only a permitted call loads the tool.
     let loaded_tools = mcp.load_called(&tool, origin, ToolDeferral::for_model(&ctx.model));
-    let (text, is_error) = match mcp.call_tool(&tool, input).await {
-        Ok(text) => (text, false),
-        Err(e) => (e.to_string(), true),
+    let (text, image, is_error) = match mcp.call_tool(&tool, input).await {
+        Ok(out) => (out.text, out.image, false),
+        Err(e) => (e.to_string(), None, true),
     };
     done(
         TextOutput {
             loaded_tools,
             ..text.into()
         },
+        image,
         is_error,
     )
 }
@@ -1383,6 +1397,69 @@ mod tests {
 
     fn mcp_ctx(mcp: &McpSession) -> ToolContext {
         with_mcp(stub_ctx(&AgentMode::Build), mcp)
+    }
+
+    struct ImageTransport;
+
+    impl crate::mcp::transport::McpTransport for ImageTransport {
+        fn send_request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> crate::mcp::transport::BoxFuture<'a, Result<Value, crate::mcp::error::McpError>>
+        {
+            Box::pin(async {
+                Ok(serde_json::json!({
+                    "content": [
+                        { "type": "text", "text": "[image: shot.png 2B 1x1]" },
+                        { "type": "image", "data": "aGk=", "mimeType": "image/png" },
+                    ],
+                }))
+            })
+        }
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> crate::mcp::transport::BoxFuture<'a, Result<(), crate::mcp::error::McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown<'a>(&'a self) -> crate::mcp::transport::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn server_name(&self) -> &Arc<str> {
+            static NAME: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+            NAME.get_or_init(|| Arc::from("image-serving"))
+        }
+        fn transport_kind(&self) -> &'static str {
+            "image"
+        }
+    }
+
+    #[test]
+    fn an_mcp_image_result_becomes_an_image_output() {
+        smol::block_on(async {
+            let mcp = crate::mcp::test_support::session_with_transport(
+                &[("img", "")],
+                Arc::new(ImageTransport),
+            );
+            let ctx = mcp_ctx(&mcp);
+            let done = dispatch(&ctx, "img", &serde_json::json!({})).await;
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            let crate::ToolOutput::Image { source, text } = &*done.output else {
+                panic!("expected an image output, got {:?}", done.output);
+            };
+            assert_eq!(text, "[image: shot.png 2B 1x1]");
+            assert_eq!(source.media_type, maki_providers::ImageMediaType::Png);
+
+            let msg = crate::types::tool_results(vec![done]);
+            assert!(
+                msg.content
+                    .iter()
+                    .any(|b| matches!(b, maki_providers::ContentBlock::Image { .. })),
+                "history must carry the image"
+            );
+        });
     }
 
     fn registered(tool: Arc<dyn Tool>) -> Arc<ToolRegistry> {

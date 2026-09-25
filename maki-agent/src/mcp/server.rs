@@ -348,7 +348,8 @@ mod tests {
             let out = transport::call_tool(&client, "echo", &json!({ "text": "hi" }))
                 .await
                 .unwrap();
-            assert_eq!(out, "hi");
+            assert_eq!(out.text, "hi");
+            assert!(out.image.is_none());
 
             let err = transport::call_tool(&client, "nope", &json!({}))
                 .await

@@ -123,6 +123,7 @@ The rules:
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
+| [`maki.mcp`](#maki-mcp) | MCP resource registration. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.provider`](#maki-provider) | Providers implemented in Lua. |
@@ -2698,6 +2699,32 @@ if root then print("project root: " .. root) end
 
 ---
 
+### `maki.fs.git_branch()` {#maki-fs-git_branch}
+
+```lua
+maki.fs.git_branch({path})
+```
+
+Return the checked-out branch of the git repository containing {path},
+or the short HEAD hash when detached. Relative paths resolve from the
+current working directory. A worktree's `.git` file is not followed.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute or relative path inside the repository.
+
+**Returns:** (`string?`) Branch name or short hash, or nil outside a repository.
+
+**Example:**
+
+```lua
+local branch = maki.fs.git_branch("src") -- "main"
+```
+
+---
+
 ### `maki.fs.relpath()` {#maki-fs-relpath}
 
 ```lua
@@ -3641,6 +3668,52 @@ Emit an ERROR-level log message. Use for failures that need attention.
 
 ```lua
 maki.log.error("failed to connect to API")
+```
+
+
+## maki.mcp {#maki-mcp}
+
+MCP resource registration. What a plugin registers here, the executor
+serves to the brain over the split-mode MCP endpoint.
+
+```lua
+maki.mcp.register_resource({
+  uri = "maki://git/branch",
+  read = function() return maki.fs.git_branch(".") or "" end,
+})
+```
+
+---
+
+### `maki.mcp.register_resource()` {#maki-mcp-register_resource}
+
+```lua
+maki.mcp.register_resource({spec})
+```
+
+Register {spec.uri} as an MCP resource this plugin serves, answered by
+{spec.read}. The executor's endpoint lists every registered URI on
+`resources/list` and routes a `resources/read` for one to its `read`.
+
+`read` is called with the requested URI and follows the `(value, err)`
+convention: a string is the resource's text content, nil plus an error
+message fails the read.
+
+One provider per URI; registering an already-registered URI replaces its
+provider. `file://` URIs are refused: that scheme is the workspace file
+corpus, served by the host itself.
+
+**Parameters:**
+
+- `{spec}` (`table`) `{ uri = string, read = function }`
+
+**Example:**
+
+```lua
+maki.mcp.register_resource({
+  uri = "maki://git/branch",
+  read = function() return maki.fs.git_branch(".") or "" end,
+})
 ```
 
 

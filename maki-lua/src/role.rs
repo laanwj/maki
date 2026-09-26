@@ -43,6 +43,13 @@ impl HostRole {
     pub(crate) fn executor_gate(self, what: &str) -> Option<mlua::Error> {
         self.is_executor().then(|| executor_gate_error(what))
     }
+
+    /// The brain serves no MCP endpoint; registering executor-served state
+    /// there would land in a void, so it fails loudly instead.
+    pub(crate) fn brain_gate(self, what: &str) -> Option<mlua::Error> {
+        matches!(self, Self::Brain)
+            .then(|| mlua::Error::runtime(format!("{what}: not available in brain-role plugins")))
+    }
 }
 
 /// The host role for this Lua state, set once at runtime creation.

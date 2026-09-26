@@ -111,6 +111,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
     },
     BundledPlugin {
+        name: "git",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/git"),
+    },
+    BundledPlugin {
         name: "skill",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
     },
@@ -660,6 +664,38 @@ impl PluginHost {
             .send(Request::CollectPluginOptions { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    /// URIs plugins registered via `maki.mcp.register_resource`. The executor
+    /// answers `resources/list` with them.
+    pub fn registered_resources(&self) -> Vec<String> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        if self
+            .inner
+            .tx
+            .send(Request::ListResources { reply: reply_tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.recv().unwrap_or_default()
+    }
+
+    /// Runs the provider registered for {uri}. `Ok(None)` when no plugin
+    /// registered it; provider errors and a dead host both come back as the
+    /// `Err` string.
+    pub fn read_registered_resource(&self, uri: &str) -> Result<Option<String>, String> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::ReadResource {
+                uri: uri.to_owned(),
+                reply: reply_tx,
+            })
+            .map_err(|_| "plugin host is dead".to_owned())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "plugin host is dead".to_owned())?
     }
 
     /// Runs a source as the global `init.lua`.
@@ -1624,6 +1660,82 @@ mod tests {
         assert!(single_reg.has("write"));
         assert!(single_reg.tool_view("write").is_none());
         assert!(!executor_reg.has("task"));
+    }
+
+    /// The bundled git plugin wires its URI to the branch of the host's cwd —
+    /// the same read the executor serves for a split-mode status bar.
+    #[test]
+    fn the_git_builtin_serves_its_branch_resource() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::executor(Arc::clone(&reg)).unwrap();
+        host.load_builtins(&maki_config::PluginsConfig {
+            enabled: true,
+            names: vec!["git".into()],
+            packages: Vec::new(),
+            opts: Default::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            host.registered_resources(),
+            vec![maki_agent::git::BRANCH_RESOURCE_URI.to_owned()]
+        );
+        // Tests run in the repo checkout, so the read answers a branch.
+        let branch = host
+            .read_registered_resource(maki_agent::git::BRANCH_RESOURCE_URI)
+            .unwrap();
+        assert!(branch.is_some(), "expected a branch, got {branch:?}");
+    }
+
+    #[test]
+    fn registered_resources_round_trip() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "res",
+            r#"maki.mcp.register_resource({
+                uri = "maki://test/thing",
+                read = function(uri) return "served:" .. uri end,
+            })"#,
+        )
+        .unwrap();
+
+        assert_eq!(host.registered_resources(), vec!["maki://test/thing"]);
+        assert_eq!(
+            host.read_registered_resource("maki://test/thing")
+                .unwrap()
+                .as_deref(),
+            Some("served:maki://test/thing")
+        );
+        assert_eq!(
+            host.read_registered_resource("maki://test/absent").unwrap(),
+            None
+        );
+
+        host.unload("res").unwrap();
+        assert!(
+            host.registered_resources().is_empty(),
+            "unloading the plugin withdraws its resources"
+        );
+    }
+
+    #[test]
+    fn resource_read_errors_come_back() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "res",
+            r#"maki.mcp.register_resource({
+                uri = "maki://test/broken",
+                read = function() return nil, "boom" end,
+            })"#,
+        )
+        .unwrap();
+        assert_eq!(
+            host.read_registered_resource("maki://test/broken")
+                .unwrap_err(),
+            "boom"
+        );
     }
 
     #[test]

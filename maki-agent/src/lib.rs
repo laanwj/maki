@@ -5,6 +5,7 @@ pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
 pub mod file_index;
+pub mod git;
 pub use file_index::{
     FILE_MATCH_CONFIG, FileIndex, FileMatch, FileQuery, FileReader, Ranked, WalkEnd,
     byte_highlights, cancel_walks, file_haystack, file_haystack_owned, file_index, file_pattern,

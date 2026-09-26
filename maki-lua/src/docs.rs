@@ -74,6 +74,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::json::VALIDATOR_DOCS,
         &api::keymap::DOCS,
         &api::log::DOCS,
+        &api::mcp::DOCS,
         &api::model::DOCS,
         &api::net::DOCS,
         &api::provider::DOCS,

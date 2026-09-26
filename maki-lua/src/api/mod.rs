@@ -10,6 +10,7 @@ pub(crate) mod interpreter;
 pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
+pub(crate) mod mcp;
 pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
@@ -107,6 +108,7 @@ pub(crate) fn create_maki_global(
     maki.set("base64", base64::create_base64_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
+    maki.set("mcp", mcp::create_mcp_table(lua, Arc::clone(&plugin))?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     // One egress value shared by the two namespaces that can open a socket, so
     // a provider registered through `maki.provider` is reachable from

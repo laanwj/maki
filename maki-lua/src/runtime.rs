@@ -201,6 +201,35 @@ pub(crate) struct ActiveView {
     pub(crate) claim: Arc<BufsClaim>,
 }
 
+/// URI → the `maki.mcp.register_resource` provider serving it. The executor's
+/// MCP endpoint lists and reads these; the store dies with its host
+/// generation, so a brain /reload's reconfigure starts empty again.
+#[derive(Default)]
+pub(crate) struct ResourceStore {
+    pub(crate) providers: HashMap<String, RegisteredResource>,
+}
+
+pub(crate) struct RegisteredResource {
+    pub(crate) plugin: Arc<str>,
+    pub(crate) read: RegistryKey,
+}
+
+impl ResourceStore {
+    pub(crate) fn clear_plugin(&mut self, lua: &Lua, plugin: &str) {
+        let owned: Vec<String> = self
+            .providers
+            .iter()
+            .filter(|(_, p)| &*p.plugin == plugin)
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        for uri in owned {
+            if let Some(p) = self.providers.remove(&uri) {
+                let _ = lua.remove_registry_value(p.read);
+            }
+        }
+    }
+}
+
 /// The runtime's own request sender, for bridges calling in from outside the
 /// Lua thread (the display hook the tool registry hands to dispatch).
 #[derive(Clone)]
@@ -497,6 +526,17 @@ pub enum Request {
     },
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
+    },
+    /// The executor answers `resources/list` with what plugins registered via
+    /// `maki.mcp.register_resource`.
+    ListResources {
+        reply: flume::Sender<Vec<String>>,
+    },
+    /// `resources/read` for a registered URI; `Ok(None)` means no plugin
+    /// registered it.
+    ReadResource {
+        uri: String,
+        reply: flume::Sender<Result<Option<String>, String>>,
     },
     /// Packages `init.lua` declared. Read after the init files have run, since
     /// that is when the declared set is complete.
@@ -2302,6 +2342,7 @@ impl LuaRuntime {
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(ToolViewStore::default());
+        lua.set_app_data(ResourceStore::default());
         lua.set_app_data(RequestTx(tx.clone()));
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(crate::api::pack::PackStore::default());
@@ -2851,6 +2892,9 @@ impl LuaRuntime {
         }
         crate::api::top::clear_notify_handler(&self.lua, plugin);
         crate::api::fs::clear_plugin_files(plugin);
+        if let Some(mut store) = self.lua.app_data_mut::<ResourceStore>() {
+            store.clear_plugin(&self.lua, plugin);
+        }
         let revision_guard = self.drop_plugin_keys(plugin);
         with_packs(&self.lua, |packs| packs.active.remove(plugin));
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
@@ -3820,6 +3864,37 @@ async fn run_view_start(
     (state, summary, handle, claim)
 }
 
+/// Runs the read callback of a `maki.mcp.register_resource` registration,
+/// following the (value, err) convention: a string is the resource's content,
+/// nil plus an error fails the read. A bare nil fails too — "no content" is
+/// spelled `""`.
+async fn run_read_resource(
+    lua: &Lua,
+    func: Function,
+    uri: String,
+) -> Result<Option<String>, String> {
+    let result = run_detached(lua, async {
+        let thread = lua.create_thread(func)?;
+        thread.into_async::<MultiValue>(uri)?.await
+    })
+    .await;
+    match result {
+        Ok(values) => {
+            let mut values = values.into_iter();
+            let value = values.next().unwrap_or(LuaValue::Nil);
+            if let LuaValue::String(err) = values.next().unwrap_or(LuaValue::Nil) {
+                return Err(err.to_string_lossy());
+            }
+            match value {
+                LuaValue::String(text) => Ok(Some(text.to_string_lossy())),
+                LuaValue::Nil => Err("resource read returned nil without an error".into()),
+                _ => Err("resource read must return a string".into()),
+            }
+        }
+        Err(e) => Err(strip_traceback(&e)),
+    }
+}
+
 async fn run_view_progress(lua: &Lua, func: Function, state: Option<LuaValue>, payload: Value) {
     let run = async {
         let state = state.unwrap_or(LuaValue::Nil);
@@ -4637,6 +4712,35 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::ListResources { reply } => {
+                            let uris = rt
+                                .lua
+                                .app_data_ref::<ResourceStore>()
+                                .map(|store| store.providers.keys().cloned().collect())
+                                .unwrap_or_default();
+                            let _ = reply.send(uris);
+                        }
+                        Request::ReadResource { uri, reply } => {
+                            let func = rt.lua.app_data_ref::<ResourceStore>().and_then(|store| {
+                                store
+                                    .providers
+                                    .get(&uri)
+                                    .and_then(|p| rt.lua.registry_value::<Function>(&p.read).ok())
+                            });
+                            match func {
+                                None => {
+                                    let _ = reply.send(Ok(None));
+                                }
+                                Some(func) => {
+                                    let lua = rt.lua.clone();
+                                    ex.spawn(async move {
+                                        let _ =
+                                            reply.send(run_read_resource(&lua, func, uri).await);
+                                    })
+                                    .detach();
+                                }
+                            }
                         }
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());

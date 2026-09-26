@@ -416,6 +416,7 @@ impl SpawnCtx {
     fn spawn_runtime(&self, open: OpenSession, slot: Arc<ModelSlot>) -> SessionRuntime {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
+        let session_cwd = open.session.cwd.clone();
         let permissions = Arc::new(self.permissions.fork());
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
@@ -457,6 +458,16 @@ impl SpawnCtx {
         );
         app.trust_question = self.trust_question.clone();
         app.split_mode = self.split_mode;
+        if self.split_mode {
+            // The bar's own cwd is this container's home; the project is the
+            // executor's, recorded in the session. The branch half is fetched
+            // from the executor: the .git it would be read from lives there.
+            app.status_bar.set_cwd(session_cwd);
+            if let Some(handle) = &self.mcp_handle {
+                let (rx, fetch) = spawn_branch_fetcher(handle.clone());
+                app.status_bar.attach_remote_branch(rx, fetch);
+            }
+        }
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
@@ -473,6 +484,34 @@ impl SpawnCtx {
             slot: cell,
         }
     }
+}
+
+/// Split mode: the workspace's .git lives on the executor, so the branch is
+/// fetched over MCP instead of watched on the local fs. A message on the
+/// returned sender triggers a fetch; every finished fetch lands on the
+/// receiver, failures included, as `None` (a branchless label, not an error).
+fn spawn_branch_fetcher(handle: McpHandle) -> (flume::Receiver<Option<String>>, flume::Sender<()>) {
+    let (branch_tx, branch_rx) = flume::bounded(1);
+    let (fetch_tx, fetch_rx) = flume::bounded::<()>(1);
+    smol::spawn(async move {
+        while fetch_rx.recv_async().await.is_ok() {
+            let branch = handle
+                .read_resource(
+                    mcp::config::EXECUTOR_SERVER_NAME,
+                    maki_agent::git::BRANCH_RESOURCE_URI,
+                )
+                .await
+                .ok()
+                .and_then(|contents| contents.into_iter().find_map(|c| c.text))
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty());
+            if branch_tx.send_async(branch).await.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+    (branch_rx, fetch_tx)
 }
 
 pub(crate) struct EventLoop<'t> {
@@ -1123,6 +1162,11 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_status = status;
+            if status == SessionStatus::Idle {
+                // A bash-driven checkout during the turn is the realistic
+                // branch changer; a single-process bar ignores the request.
+                rt.app.status_bar.request_branch_fetch();
+            }
             handle.fire_autocmd(
                 "SessionStatusChanged",
                 json!({

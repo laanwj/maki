@@ -224,7 +224,7 @@ impl ServerHandler for ExecutorHandler {
         // Corpus entries are relative to the workspace root.
         let index = maki_agent::file_index(&self.workspace);
         index.refresh();
-        index
+        let mut resources: Vec<ResourceInfo> = index
             .corpus()
             .iter()
             .map(|rel| ResourceInfo {
@@ -233,13 +233,36 @@ impl ServerHandler for ExecutorHandler {
                 description: None,
                 mime_type: None,
             })
-            .collect()
+            .collect();
+        // Plugin-registered resources (maki://git/branch and friends) sit
+        // beside the corpus; they own their non-file schemes outright.
+        if let Ok(host) = self.host.lock() {
+            resources.extend(
+                host.registered_resources()
+                    .into_iter()
+                    .map(|uri| ResourceInfo {
+                        name: uri.clone(),
+                        uri,
+                        description: None,
+                        mime_type: None,
+                    }),
+            );
+        }
+        resources
     }
 
     fn read_resource(&self, uri: &str) -> Result<Vec<ResourceContent>, String> {
-        let path = uri
-            .strip_prefix("file://")
-            .ok_or("only file:// URIs are served")?;
+        let Some(path) = uri.strip_prefix("file://") else {
+            let host = self.host.lock().map_err(|e| e.to_string())?;
+            return match host.read_registered_resource(uri)? {
+                Some(text) => Ok(vec![ResourceContent {
+                    uri: uri.into(),
+                    text: Some(text),
+                    blob: None,
+                }]),
+                None => Err(format!("no resource registered for {uri}")),
+            };
+        };
         let canonical = fs::canonicalize(Path::new(path)).map_err(|e| e.to_string())?;
         if !canonical.starts_with(&self.workspace_canonical) {
             return Err("resource is outside the workspace".into());
@@ -677,6 +700,75 @@ maki.api.register_tool({
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(!names.contains(&"task"));
+    }
+
+    /// A plugin-registered resource rides resources/list + resources/read
+    /// next to the file corpus, without touching the file:// confinement.
+    #[test]
+    fn registered_resources_cross_the_socket() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let handler = test_handler(dir.path(), &dir.path().join("skills"));
+            let push = ExecutorPush {
+                plugin_sources: vec![PluginSourcePush {
+                    name: "res".into(),
+                    source: r#"maki.mcp.register_resource({
+    uri = "maki://test/thing",
+    read = function(uri) return "served:" .. uri end,
+})"#
+                    .into(),
+                }],
+                ..Default::default()
+            };
+            let sock = dir.path().join("e.sock");
+            let listener = async_net::unix::UnixListener::bind(&sock).unwrap();
+            smol::spawn(maki_agent::mcp::server::serve_unix(
+                listener,
+                handler,
+                flume::unbounded().1,
+            ))
+            .detach();
+
+            let transport = maki_agent::mcp::socket::SocketTransport::connect(
+                "test",
+                &sock,
+                Some(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+            maki_agent::mcp::transport::initialize_with(
+                &transport,
+                Some(json!({ "executorConfig": push })),
+            )
+            .await
+            .unwrap();
+
+            let listed = maki_agent::mcp::transport::list_resources(&transport)
+                .await
+                .unwrap();
+            let uris: Vec<&str> = listed.iter().map(|r| r.uri.as_str()).collect();
+            assert!(
+                uris.contains(&"maki://test/thing"),
+                "registered resource missing from {uris:?}"
+            );
+
+            let contents =
+                maki_agent::mcp::transport::read_resource(&transport, "maki://test/thing")
+                    .await
+                    .unwrap();
+            assert_eq!(
+                contents[0].text.as_deref(),
+                Some("served:maki://test/thing")
+            );
+
+            let missing =
+                maki_agent::mcp::transport::read_resource(&transport, "maki://test/absent").await;
+            assert!(missing.is_err(), "a URI nobody registered is an error");
+
+            let outside =
+                maki_agent::mcp::transport::read_resource(&transport, "file:///etc/hostname").await;
+            assert!(outside.is_err(), "outside the workspace stays refused");
+        });
     }
 
     #[test]

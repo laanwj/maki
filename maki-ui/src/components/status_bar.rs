@@ -70,8 +70,26 @@ pub struct StatusBar {
     queued: VecDeque<String>,
     started_at: Instant,
     cwd_branch: String,
+    /// Split mode: the workspace lives on the executor, so the label is the
+    /// session's recorded cwd, and the branch lookup has no local tree to read.
+    cwd_override: Option<String>,
     pub flash_duration: Duration,
-    branch_update_rx: Option<flume::Receiver<()>>,
+    branch_source: Option<BranchSource>,
+}
+
+/// Where the branch half of the cwd label comes from.
+enum BranchSource {
+    /// Single-process: a notify watcher on .git/HEAD wakes the poll, which
+    /// re-reads the branch from disk.
+    Watcher(flume::Receiver<()>),
+    /// Split mode: the branch is fetched from the executor over MCP. `fetch`
+    /// asks for another read; every finished read lands on `rx`, failures
+    /// included, as `None` (the bar just shows no branch).
+    Remote {
+        rx: flume::Receiver<Option<String>>,
+        fetch: flume::Sender<()>,
+        latest: Option<String>,
+    },
 }
 
 impl StatusBar {
@@ -81,8 +99,9 @@ impl StatusBar {
             queued: VecDeque::new(),
             started_at: Instant::now(),
             cwd_branch: cwd_branch_label(),
+            cwd_override: None,
             flash_duration,
-            branch_update_rx: spawn_branch_watcher(),
+            branch_source: spawn_branch_watcher().map(BranchSource::Watcher),
         }
     }
 
@@ -109,19 +128,84 @@ impl StatusBar {
     }
 
     pub fn refresh_cwd(&mut self) {
-        self.cwd_branch = cwd_branch_label();
+        self.cwd_branch = self.compute_label();
+    }
+
+    /// Split mode: the workspace is the executor's, recorded in the session.
+    pub fn set_cwd(&mut self, cwd: String) {
+        self.cwd_override = Some(cwd);
+        self.refresh_cwd();
+    }
+
+    /// Split mode: the workspace's .git lives on the executor, so instead of
+    /// a filesystem watcher the bar takes the fetch channel pair. The first
+    /// fetch is triggered here; later ones ride [`Self::request_branch_fetch`].
+    pub fn attach_remote_branch(
+        &mut self,
+        rx: flume::Receiver<Option<String>>,
+        fetch: flume::Sender<()>,
+    ) {
+        let _ = fetch.try_send(());
+        self.branch_source = Some(BranchSource::Remote {
+            rx,
+            fetch,
+            latest: None,
+        });
+        self.refresh_cwd();
+    }
+
+    /// Asks the executor for the branch again. A turn that just settled is
+    /// the realistic moment a checkout changed it.
+    pub fn request_branch_fetch(&self) {
+        if let Some(BranchSource::Remote { fetch, .. }) = &self.branch_source {
+            let _ = fetch.try_send(());
+        }
+    }
+
+    fn remote_branch(&self) -> Option<&str> {
+        match &self.branch_source {
+            Some(BranchSource::Remote { latest, .. }) => latest.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn compute_label(&self) -> String {
+        match &self.cwd_override {
+            Some(cwd) => {
+                let label = collapse_home(cwd);
+                match self.remote_branch() {
+                    Some(branch) => format!("{label}:{branch}"),
+                    None => label,
+                }
+            }
+            None => cwd_branch_label(),
+        }
     }
 
     pub fn poll_branch_update(&mut self) -> Dirty {
-        let Some(rx) = &self.branch_update_rx else {
-            return Dirty::NO;
-        };
-        if rx.try_iter().next().is_none() {
-            return Dirty::NO;
+        match &mut self.branch_source {
+            Some(BranchSource::Watcher(rx)) => {
+                if rx.try_iter().next().is_none() {
+                    return Dirty::NO;
+                }
+            }
+            Some(BranchSource::Remote { rx, latest, .. }) => {
+                // Every queued fetch reports the branch it saw; only the
+                // newest has anything left to say.
+                let mut fetched = None;
+                for branch in rx.try_iter() {
+                    fetched = Some(branch);
+                }
+                match fetched {
+                    Some(branch) => *latest = branch,
+                    None => return Dirty::NO,
+                }
+            }
+            None => return Dirty::NO,
         }
-        let branch = cwd_branch_label();
-        let changed = branch != self.cwd_branch;
-        self.cwd_branch = branch;
+        let label = self.compute_label();
+        let changed = label != self.cwd_branch;
+        self.cwd_branch = label;
         Dirty::from(changed)
     }
 
@@ -366,37 +450,9 @@ fn cwd_branch_label() -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
     let label = collapse_home(&cwd);
-    match detect_branch(&cwd) {
+    match maki_agent::git::detect_branch(Path::new(&cwd)) {
         Some(branch) => format!("{label}:{branch}"),
         None => label,
-    }
-}
-
-fn detect_branch(cwd: &str) -> Option<String> {
-    let head = std::fs::read_to_string(find_git_dir(Path::new(cwd))?.join("HEAD")).ok()?;
-    let head = head.trim();
-    head.strip_prefix("ref: refs/heads/")
-        .map(str::to_string)
-        .or_else(|| Some(head.get(..7)?.to_string()))
-}
-
-fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
-    let mut dir = cwd;
-    loop {
-        let git = dir.join(".git");
-        if git.is_dir() {
-            return Some(git);
-        }
-        if let Ok(contents) = std::fs::read_to_string(&git) {
-            let path = contents.trim().strip_prefix("gitdir: ")?.trim_start();
-            let path = Path::new(path);
-            return Some(if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                dir.join(path)
-            });
-        }
-        dir = dir.parent()?;
     }
 }
 
@@ -404,7 +460,7 @@ fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
     use notify::{RecursiveMode, Watcher};
 
     let cwd = env::current_dir().ok()?;
-    let git_dir = find_git_dir(&cwd)?;
+    let git_dir = maki_agent::git::find_git_dir(&cwd)?;
     let (tx, rx) = flume::bounded(1);
 
     std::thread::spawn(move || {
@@ -425,11 +481,8 @@ fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
     use crate::repaint::expect::QUIET;
-    use tempfile::TempDir;
     use test_case::test_case;
 
     const FLASH_TTL: Duration = Duration::from_secs(3600);
@@ -577,49 +630,48 @@ mod tests {
         assert_eq!(truncate_tail(input, max_width), expected);
     }
 
-    fn tmp_with_head(content: Option<&str>) -> (TempDir, String) {
-        let dir = TempDir::new().unwrap();
-        if let Some(head) = content {
-            let git = dir.path().join(".git");
-            fs::create_dir(&git).unwrap();
-            fs::write(git.join("HEAD"), head).unwrap();
-        }
-        let path = dir.path().to_string_lossy().into_owned();
-        (dir, path)
-    }
-
+    /// Split mode composes the label from the session cwd and the branch the
+    /// executor's last fetch saw, never from the brain's own tree.
     #[test]
-    fn detect_branch_from_worktree() {
-        let dir = TempDir::new().unwrap();
-        let wt_head = dir.path().join("main/.git/worktrees/wt");
-        fs::create_dir_all(&wt_head).unwrap();
-        fs::write(dir.path().join("main/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(wt_head.join("HEAD"), "ref: refs/heads/db/worktree-branch\n").unwrap();
-        let wt = dir.path().join("wt");
-        fs::create_dir(&wt).unwrap();
-        fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_head.display())).unwrap();
-        assert_eq!(
-            detect_branch(&wt.to_string_lossy()),
-            Some("db/worktree-branch".to_string())
+    fn split_label_follows_the_fetched_branch() {
+        let (fetch_tx, fetch_rx) = flume::bounded(1);
+        let (branch_tx, branch_rx) = flume::bounded(1);
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.set_cwd("/work/project".into());
+        bar.attach_remote_branch(branch_rx, fetch_tx);
+        assert!(
+            fetch_rx.try_recv().is_ok(),
+            "attaching triggers the first fetch"
         );
-    }
 
-    #[test_case(Some("ref: refs/heads/feature/foo\n"), Some("feature/foo") ; "regular_ref")]
-    #[test_case(Some("abc1234deadbeef\n"),            Some("abc1234")      ; "detached_head")]
-    #[test_case(None,                                 None                 ; "no_git_dir")]
-    fn detect_branch_cases(head: Option<&str>, expected: Option<&str>) {
-        let (_dir, path) = tmp_with_head(head);
-        assert_eq!(detect_branch(&path), expected.map(String::from));
+        branch_tx.send(Some("main".into())).unwrap();
+        assert_eq!(bar.poll_branch_update(), Dirty::YES);
+        assert_eq!(bar.cwd_branch, "/work/project:main");
+
+        // A fetch that found no repository drops the branch half.
+        branch_tx.send(None).unwrap();
+        assert_eq!(bar.poll_branch_update(), Dirty::YES);
+        assert_eq!(bar.cwd_branch, "/work/project");
+
+        assert_eq!(bar.poll_branch_update(), Dirty::NO, "{QUIET}");
     }
 
     #[test]
-    fn detect_branch_from_subdirectory() {
-        let (_dir, path) = tmp_with_head(Some("ref: refs/heads/main\n"));
-        let sub = Path::new(&path).join("sub");
-        fs::create_dir(&sub).unwrap();
+    fn branch_fetch_requests_coalesce() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.request_branch_fetch();
+
+        let (fetch_tx, fetch_rx) = flume::bounded(1);
+        let (_branch_tx, branch_rx) = flume::bounded(1);
+        bar.attach_remote_branch(branch_rx, fetch_tx);
+        fetch_rx.try_recv().unwrap();
+
+        bar.request_branch_fetch();
+        bar.request_branch_fetch();
         assert_eq!(
-            detect_branch(&sub.to_string_lossy()),
-            Some("main".to_string())
+            fetch_rx.try_iter().count(),
+            1,
+            "a pending fetch makes the next request a no-op"
         );
     }
 
@@ -730,7 +782,7 @@ mod tests {
         } else {
             label.clone()
         };
-        bar.branch_update_rx = Some(rx);
+        bar.branch_source = Some(BranchSource::Watcher(rx));
         tx.send(()).unwrap();
 
         let dirty = bar.poll_branch_update();

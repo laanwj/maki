@@ -47,4 +47,5 @@ getrandom = { workspace = true }
 maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 

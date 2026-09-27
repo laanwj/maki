@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use serde_json::{Value, json};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
@@ -153,6 +153,9 @@ pub struct Agent<'h> {
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
     overflow_recoveries: u32,
+    /// Content hash of the last dumped request, so the debug dump fires on
+    /// change, not per turn.
+    request_log_hash: u64,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -199,6 +202,7 @@ impl<'h> Agent<'h> {
             mcp: None,
             reauth_attempts: 0,
             overflow_recoveries: 0,
+            request_log_hash: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             task_id: params.task_id,
@@ -435,6 +439,12 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         let tools = request_tools(&self.tools, self.mcp.as_ref());
+        log_request_content(
+            &mut self.request_log_hash,
+            &self.model,
+            &self.system,
+            tools.as_ref(),
+        );
         let response = match stream_with_retry(
             StreamRequest {
                 provider: &*self.provider,
@@ -992,6 +1002,26 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 /// Free-standing rather than a method, so a caller can hold the result and
 /// still reach `&mut self.gauge`, and so a frontend sizing the same prompt
 /// outside a run does not rebuild the array by hand.
+/// Debug-dumps the stable request content — system prompt and the full tool
+/// definitions — whenever it changes. Per-turn logging would flood the debug
+/// log with identical payloads, so a hash gates it. `MAKI_LOG=debug` keeps it.
+fn log_request_content(last_hash: &mut u64, model: &Model, system: &str, tools: &Value) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(system, &mut hasher);
+    std::hash::Hash::hash(&tools.to_string(), &mut hasher);
+    let hash = std::hash::Hasher::finish(&hasher);
+    if *last_hash == hash {
+        return;
+    }
+    *last_hash = hash;
+    debug!(
+        model = %model.id,
+        system_prompt = %system,
+        tools = %serde_json::to_string_pretty(tools).unwrap_or_default(),
+        "provider request content"
+    );
+}
+
 pub fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
     match mcp {
         Some(mcp) => {
@@ -1024,6 +1054,60 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::{EarlierInput, Envelope};
+
+    #[test]
+    fn request_content_dumps_once_per_change() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<String>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Capture {
+            type Writer = Capture;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+            let tools = serde_json::json!([{ "name": "read", "description": "read a file" }]);
+            let mut hash = 0;
+            log_request_content(&mut hash, &model, "the system prompt", &tools);
+            log_request_content(&mut hash, &model, "the system prompt", &tools);
+            let changed = serde_json::json!([{ "name": "write", "description": "write a file" }]);
+            log_request_content(&mut hash, &model, "the system prompt", &changed);
+        });
+
+        let out = capture.0.lock().unwrap();
+        let dumps = out.matches("provider request content").count();
+        assert_eq!(dumps, 2, "got: {out}");
+        assert!(
+            out.contains("read a file"),
+            "tool descriptions logged: {out}"
+        );
+        assert!(
+            out.contains("the system prompt"),
+            "system prompt logged: {out}"
+        );
+    }
 
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";

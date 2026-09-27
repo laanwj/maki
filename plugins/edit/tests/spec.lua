@@ -456,4 +456,73 @@ case("view_blocks_insert_lines_offsets_the_line", function()
   eq(blocks[1].nr, 5)
 end)
 
+-- Regression: old_string present nowhere intact, its lines scattered across
+-- two functions. Any "edit" here splices across the gap and corrupts the file.
+case("block_anchor_never_splices_across_a_gap", function()
+  local content = table.concat({
+    "fn alpha() {",
+    "    if cond {",
+    "        // a differing line in the middle",
+    "        do_alpha();",
+    "    }",
+    "}",
+    "",
+    "fn filler_one() {}",
+    "fn filler_two() {}",
+    "",
+    "fn beta() {",
+    "    if cond {",
+    "        do_beta();",
+    "    }",
+    "}",
+    "",
+    "fn gamma() {",
+    "    if cond {",
+    "        uim.create_ui_element(",
+    "            stuff",
+    "        );",
+    "    }",
+    "}",
+  }, "\n")
+  local result, err = fr.replace(
+    content,
+    "    if cond {\n        do_alpha_setup();\n        uim.create_ui_element(",
+    "    if cond {\n        NEW_LINE_ONE;\n        uim.create_ui_element(",
+    false
+  )
+  eq(result, nil)
+  eq(err, fr.NO_MATCH)
+end)
+
+-- The pattern's site must lose exactly its own lines: an earlier partial
+-- lookalike must not stretch the block.
+case("block_anchor_match_replaces_exactly_its_own_lines", function()
+  local content = table.concat({
+    "fn beta() {",
+    "    if cond {",
+    "        do_beta();",
+    "    }",
+    "}",
+    "",
+    "fn gamma() {",
+    "    if cond {",
+    "        do_alpha_setup();",
+    "        uim.create_ui_element(",
+    "            stuff",
+    "        );",
+    "    }",
+    "}",
+  }, "\n")
+  -- middle line differs in content, so only block_anchor can match
+  local out = fr.replace(
+    content,
+    "    if cond {\n        do_alpha_setup_v2();\n        uim.create_ui_element(",
+    "    if cond {\n        NEW;\n        uim.create_ui_element(",
+    false
+  )
+  has(out, "NEW;")
+  has(out, "fn beta() {")
+  eq(select(2, out:gsub("\n", "")), select(2, content:gsub("\n", "")), "line count unchanged")
+end)
+
 th.report()

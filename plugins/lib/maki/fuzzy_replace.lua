@@ -4,10 +4,9 @@ M.NO_MATCH = "old_string not found in file"
 M.MULTIPLE_MATCHES = "old_string matches multiple locations; add surrounding context to make it unique"
 M.EMPTY_OLD_STRING = "old_string must not be empty"
 
-local SINGLE_CANDIDATE_THRESHOLD = 0.0
-local MULTI_CANDIDATE_THRESHOLD = 0.3
 local CONTEXT_AWARE_LINE_MIN = 3
 local CONTEXT_AWARE_MATCH_RATIO = 0.5
+local BLOCK_ANCHOR_MIN_SIMILARITY = 0.5
 local INDENT_PATTERN = "^[ \t]*"
 
 local function split_lines(s)
@@ -440,51 +439,35 @@ local function block_anchor(content, find)
   if #search_lines < CONTEXT_AWARE_LINE_MIN then
     return {}
   end
+  if #search_lines > #content_lines then
+    return {}
+  end
 
   local first_trimmed = trim(search_lines[1])
   local last_trimmed = trim(search_lines[#search_lines])
 
   local candidates = {}
-  for i = 1, #content_lines do
+  for i = 1, #content_lines - #search_lines + 1 do
     if trim(content_lines[i]) == first_trimmed then
-      local tail_start = i + 2
-      if tail_start <= #content_lines then
-        for j = tail_start, #content_lines do
-          if trim(content_lines[j]) == last_trimmed then
-            candidates[#candidates + 1] = { i, j }
-            break
-          end
-        end
+      local e = i + #search_lines - 1
+      if trim(content_lines[e]) == last_trimmed then
+        candidates[#candidates + 1] = table_slice(content_lines, i, #search_lines)
       end
     end
   end
-
   if #candidates == 0 then
     return {}
   end
 
-  if #candidates == 1 then
-    local c = candidates[1]
-    local count = c[2] - c[1] + 1
-    local block = table_slice(content_lines, c[1], count)
-    local sim = middle_similarity(block, search_lines)
-    if sim >= SINGLE_CANDIDATE_THRESHOLD then
-      return { table.concat(block, "\n") }
-    end
-    return {}
-  end
-
   local best_block, best_sim = nil, -1.0
-  for _, c in ipairs(candidates) do
-    local count = c[2] - c[1] + 1
-    local block = table_slice(content_lines, c[1], count)
+  for _, block in ipairs(candidates) do
     local sim = middle_similarity(block, search_lines)
     if sim > best_sim then
       best_block, best_sim = block, sim
     end
   end
 
-  if best_sim >= MULTI_CANDIDATE_THRESHOLD then
+  if best_sim >= BLOCK_ANCHOR_MIN_SIMILARITY then
     return { table.concat(best_block, "\n") }
   end
   return {}

@@ -18,6 +18,7 @@ local INSERT_LINES_DESCRIPTION =
 local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 
 - The old_string must appear exactly once unless replace_all is true.
+- Tolerates whitespace and indentation drift in old_string; a match is always one contiguous block, never a partial prefix.
 - Read the file first to get exact content.
 - When copying text from read output, do NOT include the line number prefix (e.g. `42: `) - only the content after it.
 - Prefer this over write for targeted changes - it uses far fewer tokens.

@@ -20,6 +20,7 @@ local INSERT_LINES_DESCRIPTION =
 local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 
 - The old_string must appear exactly once unless replace_all is true.
+- Tolerates whitespace and indentation drift in old_string; a match is always one contiguous block, never a partial prefix.
 - Read the file first to get exact content.
 - When copying text from read output, do NOT include the line number prefix (e.g. `42: `) - only the content after it.
 - Prefer this over write for targeted changes - it uses far fewer tokens.
@@ -30,7 +31,7 @@ local MULTIEDIT_DESCRIPTION = [[Make multiple find-and-replace edits to a single
 Prefer this over edit when making multiple changes to the same file.
 
 - Read the file first to get exact content.
-- old_string must match the file contents exactly, including all whitespace and indentation.
+- Tolerates whitespace and indentation drift in old_string; a match is always one contiguous block, never a partial prefix.
 - Each edit must match exactly once unless replace_all is true. Use replace_all for renaming across a file.
 - Edits are applied in sequence - each operates on the result of the previous.
 - If any edit fails, none are written.

@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -138,6 +139,9 @@ pub struct Agent<'h> {
     event_tx: EventSender,
     tools: RequestTools,
     mode: AgentMode,
+    /// The session's plan file, refreshed from every input; build mode does
+    /// not clear it.
+    plan_path: Option<PathBuf>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
@@ -189,6 +193,7 @@ impl<'h> Agent<'h> {
             event_tx: run.event_tx,
             tools: run.tools,
             mode: AgentMode::default(),
+            plan_path: None,
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
@@ -271,6 +276,7 @@ impl<'h> Agent<'h> {
         let AgentInput {
             message,
             mode,
+            plan_path,
             images,
             preamble,
             earlier,
@@ -308,6 +314,7 @@ impl<'h> Agent<'h> {
             return Ok(DoneReason::Dropped);
         };
         self.mode = mode;
+        self.plan_path = plan_path;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
 
@@ -796,6 +803,7 @@ impl<'h> Agent<'h> {
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
+            plan_path: self.plan_path.clone(),
             session_id: self.session_id.clone(),
             task_id: self.task_id.clone(),
             tool_use_id: None,
@@ -957,6 +965,7 @@ impl<'h> Agent<'h> {
                     let message = kept.map(|text| interrupt_message(text, input.images));
                     if message.is_some() {
                         self.mode = input.mode;
+                        self.plan_path = input.plan_path;
                         // The user spoke, so `agent.stop` gets its full
                         // allowance back.
                         self.stop_continuations = 0;
@@ -1321,6 +1330,7 @@ mod tests {
         AgentInput {
             message: "hello".into(),
             mode: AgentMode::Build,
+            plan_path: None,
             images: Vec::new(),
             preamble: Vec::new(),
             earlier: Vec::new(),

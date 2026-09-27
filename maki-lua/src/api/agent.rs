@@ -912,6 +912,7 @@ async fn prompt(
     let input = AgentInput {
         message,
         mode: AgentMode::Build,
+        plan_path: None,
         images: Vec::new(),
         preamble: Vec::new(),
         earlier: Vec::new(),

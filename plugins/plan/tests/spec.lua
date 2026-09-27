@@ -1,0 +1,53 @@
+local plan_ops = require("plan_ops")
+local th = require("maki.test_helpers")
+
+local case = th.case
+local eq = th.eq
+
+case("read_plan_missing_reports_missing", function()
+  local tmpdir = th.mktmpdir("plan_spec")
+  local content, err = plan_ops.read_plan(maki.fs.joinpath(tmpdir, "plan.md"))
+  eq(content, nil)
+  eq(err, "missing")
+  th.rmtree(tmpdir)
+end)
+
+case("write_then_read_round_trips", function()
+  local tmpdir = th.mktmpdir("plan_spec")
+  local path = maki.fs.joinpath(tmpdir, "nested", "plan.md")
+  eq(plan_ops.write_plan(path, "# Plan\n\n- step"), true)
+  eq(plan_ops.read_plan(path), "# Plan\n\n- step")
+  th.rmtree(tmpdir)
+end)
+
+case("edit_plan_replaces_exactly_once", function()
+  local tmpdir = th.mktmpdir("plan_spec")
+  local path = maki.fs.joinpath(tmpdir, "plan.md")
+  plan_ops.write_plan(path, "alpha beta alpha")
+  local before, after = plan_ops.edit_plan(path, "beta", "gamma")
+  eq(before, "alpha beta alpha")
+  eq(after, "alpha gamma alpha")
+  eq(maki.fs.read(path), "alpha gamma alpha")
+  th.rmtree(tmpdir)
+end)
+
+case("edit_plan_without_a_file_points_at_plan_write", function()
+  local tmpdir = th.mktmpdir("plan_spec")
+  local before, err = plan_ops.edit_plan(maki.fs.joinpath(tmpdir, "plan.md"), "a", "b")
+  eq(before, nil)
+  eq(err, "no plan file yet; create it with plan_write")
+  th.rmtree(tmpdir)
+end)
+
+case("edit_plan_duplicate_match_errors", function()
+  local tmpdir = th.mktmpdir("plan_spec")
+  local path = maki.fs.joinpath(tmpdir, "plan.md")
+  plan_ops.write_plan(path, "dup dup")
+  local before, err = plan_ops.edit_plan(path, "dup", "x")
+  eq(before, nil)
+  assert(err ~= nil, "ambiguous edit must error")
+  eq(maki.fs.read(path), "dup dup", "a failed edit leaves the file alone")
+  th.rmtree(tmpdir)
+end)
+
+th.report()

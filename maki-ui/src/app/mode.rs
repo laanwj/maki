@@ -140,6 +140,9 @@ impl App {
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
+            // The plan file outlives plan mode: the agent reads and amends
+            // it while building.
+            plan_path: self.state.plan.path().map(Path::to_path_buf),
             images: msg.images.clone(),
             preamble: Vec::new(),
             earlier: Vec::new(),

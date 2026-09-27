@@ -465,24 +465,6 @@ impl PermissionManager {
             return PermissionCheck::Allowed;
         }
 
-        // Plan file auto-allow: fires AFTER deny rules have been evaluated.
-        // Only triggers if ALL pending scopes match the plan file path.
-        // A single non-plan scope means we must prompt for the rest.
-        // Compared the way the write lands: `link/../plan.md` is the plan
-        // file lexically but somewhere else once `link` is followed.
-        if !force_prompt && !pending.is_empty() {
-            let is_plan_write = plan_path.is_some_and(|pp| {
-                matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
-                    && {
-                        let plan = normalize_scope_prefix(pp);
-                        pending.iter().all(|s| normalize_scope_prefix(s) == plan)
-                    }
-            });
-            if is_plan_write {
-                return PermissionCheck::Allowed;
-            }
-        }
-
         let eff = self
             .tool_defaults
             .get(tool)
@@ -2053,21 +2035,6 @@ mod tests {
         ));
     }
 
-    #[test_case("write", true ; "write_tool_allowed")]
-    #[test_case("edit", true ; "edit_tool_allowed")]
-    #[test_case("bash", false ; "non_write_tool_prompts")]
-    fn plan_path_auto_allows_file_write_tools_only(tool: &str, expect_allowed: bool) {
-        let plan_path = Path::new(PLAN_FILE);
-        let mgr = default_mgr();
-        assert_eq!(
-            matches!(
-                mgr.check(&ToolKey::native(tool), PLAN_FILE, Some(plan_path)),
-                PermissionCheck::Allowed
-            ),
-            expect_allowed,
-        );
-    }
-
     /// Plan mode is read-only and an MCP server can write without saying so,
     /// so approving one for the user would break that. Native tools are known,
     /// and the ones plan mode does not block stay automatic.
@@ -2197,64 +2164,5 @@ mod tests {
             mgr.check(&ToolKey::native("edit"), "/x/f", None),
             PermissionCheck::Denied
         ));
-    }
-
-    #[test]
-    fn plan_path_multi_scope_all_must_match() {
-        let plan_path = Path::new(PLAN_FILE);
-        let mgr = default_mgr();
-
-        // All scopes match plan → allowed
-        assert!(matches!(
-            mgr.check_multi(
-                &ToolKey::native("write"),
-                &[PLAN_FILE, PLAN_FILE],
-                false,
-                Some(plan_path),
-            ),
-            PermissionCheck::Allowed
-        ));
-
-        // One scope is non-plan → needs prompt
-        assert!(matches!(
-            mgr.check_multi(
-                &ToolKey::native("write"),
-                &[PLAN_FILE, "/etc/passwd"],
-                false,
-                Some(plan_path),
-            ),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
-    }
-
-    /// `away/..` spells the plan file, but `away` is a symlink, so the write
-    /// lands beside its target instead. A symlinked spelling of the plan file
-    /// itself still is the plan file.
-    #[test]
-    #[cfg(unix)]
-    fn plan_auto_allow_follows_symlinks_like_the_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        let plans = dir.path().join("plans");
-        let elsewhere = dir.path().join("elsewhere/deep");
-        std::fs::create_dir_all(&plans).unwrap();
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, plans.join("away")).unwrap();
-        std::os::unix::fs::symlink(&plans, dir.path().join("alias")).unwrap();
-        let plan = plans.join("plan.md");
-        let mgr = mgr_with(PermissionsConfig::default(), cwd.path().to_path_buf());
-        let write = ToolKey::native("write");
-
-        for (scope, expected) in [
-            (plans.join("away/../plan.md"), PROMPTS),
-            (dir.path().join("alias/plan.md"), ALLOWED),
-        ] {
-            let scope = scope.to_string_lossy();
-            assert_eq!(
-                outcome(mgr.check(&write, &scope, Some(&plan))),
-                expected,
-                "{scope}"
-            );
-        }
     }
 }

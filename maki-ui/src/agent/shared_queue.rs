@@ -58,10 +58,13 @@ impl QueuedInput {
     /// Destructured on purpose: a new `AgentInput` field then has to be
     /// classified here instead of silently merging across.
     fn batch_key(&self) -> Option<BatchKey> {
+        // plan_path rides the mode: a fresh plan file only ever appears with
+        // a plan-mode switch, which the key already separates on.
         let AgentInput {
             mode,
             workflow,
             prompt,
+            plan_path: _,
             message: _,
             images: _,
             preamble: _,
@@ -319,6 +322,7 @@ mod tests {
         AgentInput {
             message: message.into(),
             mode: Default::default(),
+            plan_path: None,
             images: Vec::new(),
             preamble: Vec::new(),
             earlier: Vec::new(),

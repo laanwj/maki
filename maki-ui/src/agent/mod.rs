@@ -474,6 +474,7 @@ mod tests {
             input: AgentInput {
                 message: text.into(),
                 mode: AgentMode::default(),
+                plan_path: None,
                 images: Vec::new(),
                 preamble: Vec::new(),
                 earlier: Vec::new(),

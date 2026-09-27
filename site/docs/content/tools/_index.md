@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 24 built-in tools in this reference (23 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -204,6 +204,31 @@ Load a skill that provides instructions and workflows for specific tasks.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
+
+### `plan_read` {#plan_read}
+
+Read the session's plan file. Works in any mode, as long as the session has a plan.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+
+### `plan_write` {#plan_write}
+
+Write the session's plan file, replacing existing content.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `content` | string | yes | The complete plan content |
+
+### `plan_edit` {#plan_edit}
+
+Replace an exact string match in the session's plan file.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `new_string` | string | yes |  | Replacement string |
+| `old_string` | string | yes |  | Exact string to find (must match uniquely unless replace_all is true) |
+| `replace_all` | boolean | no | false | Replace all occurrences |
 
 ## Web
 

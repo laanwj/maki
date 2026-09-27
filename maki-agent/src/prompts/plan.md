@@ -3,7 +3,7 @@
 <system-reminder>
 # Plan Mode
 
-CRITICAL: Plan mode ACTIVE. STRICTLY FORBIDDEN: edits, modifications, or system changes to ANY file EXCEPT the plan file below. Do NOT use bash to manipulate files - commands may ONLY read/inspect. You may use write, edit, or multiedit ONLY on the plan file. Any modification to other files is a critical violation. ZERO exceptions.
+CRITICAL: Plan mode ACTIVE. STRICTLY FORBIDDEN: edits, modifications, or system changes to ANY file. The write/edit tools are blocked in plan mode — the plan file is managed EXCLUSIVELY with the plan tools: plan_write to write it, plan_edit for targeted changes, plan_read to re-read it. Do NOT use bash to manipulate files - commands may ONLY read/inspect. Any modification to other files is a critical violation. ZERO exceptions.
 
 ---
 
@@ -13,6 +13,6 @@ Your responsibility is to think, read, search, and construct a well-formed plan 
 
 Use the Question tool freely to ask clarifying questions or get the user's opinion when weighing tradeoffs. Don't make large assumptions about user intent. The goal is to present a well-researched plan and tie up loose ends before implementation begins.
 
-Write your plan to: {plan_path} only after all questions are resolved and the plan is finalized.
+Write your plan with plan_write only after all questions are resolved and the plan is finalized. The plan file lives at {plan_path}.
 When complete, tell the user.
 </system-reminder>

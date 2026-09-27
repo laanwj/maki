@@ -103,6 +103,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "memory",
     "mistral",
     "openrouter",
+    "plan",
     "question",
     "read",
     "regolo",

@@ -623,22 +623,19 @@ async fn run_native_tool(
     let mutated = invocation.mutable_path().map(FileKey::new);
 
     if let Some(key) = &mutated {
-        let is_plan_target = ctx
-            .mode
-            .plan_path()
-            .is_some_and(|plan| FileKey::new(plan) == *key);
-        if !is_plan_target {
-            if ctx.mode.plan_path().is_some() {
-                warn!(
-                    tool = %name,
-                    target = %key.as_path().display(),
-                    "blocked write in plan mode"
-                );
-                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
-            }
-            if let Some(reason) = ctx.permissions.boundary_block_reason(key.as_path()) {
-                return done_error(reason);
-            }
+        // Plan mode is read-only, the plan file included: it lives with the
+        // session's state and is written by the plan tools, which name no
+        // input path and so never reach this gate.
+        if ctx.mode.plan_path().is_some() {
+            warn!(
+                tool = %name,
+                target = %key.as_path().display(),
+                "blocked write in plan mode"
+            );
+            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        }
+        if let Some(reason) = ctx.permissions.boundary_block_reason(key.as_path()) {
+            return done_error(reason);
         }
     }
 
@@ -958,6 +955,12 @@ async fn execute_mcp_tool(
     };
 
     let result = async {
+        // The executor's tools keep bare names across the socket, so this
+        // names exactly a split session's file tools: the native gate above
+        // never sees their mutable_path, but plan mode still means read-only.
+        if ctx.mode.plan_path().is_some() && maki_config::FILE_WRITE_TOOLS.contains(&&*tool) {
+            return Err(crate::tools::PLAN_WRITE_RESTRICTED.to_owned());
+        }
         let perm_tool =
             ToolKey::parse(&tool).map_err(|e| format!("invalid MCP tool key '{tool}': {e}"))?;
         gate_on_input(ctx, &perm_tool, id, input, ask).await?;
@@ -2024,12 +2027,11 @@ mod tests {
         }
     }
 
-    /// The write gate reads its target off the rewritten input, so a hook
-    /// cannot point a plan-mode write anywhere but the plan file. The
-    /// untouched call is the control, otherwise the gate could be refusing for
-    /// some unrelated reason.
+    /// The write gate reads its target off the rewritten input, and plan mode
+    /// blocks a file tool wherever it points — the plan file included, which
+    /// only the plan tools write.
     #[test_case(RecordingHook::answering(rewrite_the_target), crate::tools::PLAN_WRITE_RESTRICTED.to_owned() ; "rewritten_away_from_the_plan_file")]
-    #[test_case(RecordingHook::default(),                     ran(PLAN_PATH)                                 ; "left_on_the_plan_file")]
+    #[test_case(RecordingHook::default(),                     crate::tools::PLAN_WRITE_RESTRICTED.to_owned() ; "left_on_the_plan_file")]
     fn a_rewritten_write_target_is_still_plan_gated(hook: RecordingHook, expected: String) {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
@@ -2904,6 +2906,39 @@ mod tests {
                 !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
                 "an unapproved call must not load the definition"
             );
+        });
+    }
+
+    /// The executor's tools keep bare names on the wire, so a split session's
+    /// `write` looks exactly like this: the native gate never sees its
+    /// mutable_path, and plan mode blocks it here instead.
+    #[test]
+    fn executor_file_tool_is_blocked_in_plan_mode() {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&["write"]));
+            let done = dispatch(
+                &ctx,
+                "write",
+                &serde_json::json!({ "path": PLAN_PATH, "content": "x" }),
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), crate::tools::PLAN_WRITE_RESTRICTED);
+        });
+    }
+
+    /// A third-party server whose tool happens to be called `write` is not
+    /// the executor's file tool: its qualified name never matches the
+    /// bare-name gate, and plan mode keeps putting it in front of the user.
+    #[test]
+    fn third_party_write_in_plan_mode_prompts_instead_of_blocking() {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&["srv.write"]));
+            let done = dispatch(&ctx, "srv__write", &serde_json::json!({})).await;
+            let text = done.output.as_text();
+            assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
         });
     }
 

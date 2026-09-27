@@ -120,6 +120,10 @@ pub struct EarlierInput {
 pub struct AgentInput {
     pub message: String,
     pub mode: AgentMode,
+    /// The session's plan file in any mode, so the plan tools can reach it
+    /// after plan mode is left. Independent of `mode`: `AgentMode::Plan`'s
+    /// payload is the same path while plan mode is active.
+    pub plan_path: Option<PathBuf>,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
     /// The rest of a burst of queued messages, oldest first.
@@ -145,6 +149,7 @@ impl AgentInput {
     ) -> Self {
         Self {
             message,
+            plan_path: mode.plan_path().map(Path::to_path_buf),
             mode,
             images,
             preamble: Vec::new(),

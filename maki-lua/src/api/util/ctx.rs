@@ -261,6 +261,18 @@ impl UserData for LuaCtx {
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
 
+        // The session's plan file, whichever mode the session is in. Nil
+        // while the session has no plan, an error outside handler ctxs.
+        methods.add_method("plan_path", |_, this, ()| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("plan_path"));
+            };
+            Ok((
+                agent.plan_path.as_ref().map(|p| p.display().to_string()),
+                None,
+            ))
+        });
+
         methods.add_method("restore_reason", |_, this, ()| {
             let Some(reason) = this.restore_reason() else {
                 return Ok(this.cap_err_pair("restore_reason"));

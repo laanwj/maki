@@ -276,9 +276,11 @@ fn wrap_update(parts: &[String]) -> String {
     format!("{UPDATE_OPEN}{}{UPDATE_CLOSE}", parts.join("\n\n"))
 }
 
-fn plan_text(plan_path: &Path, prompts: &ResolvedPrompts) -> String {
-    let vars = Vars::new().set("{plan_path}", plan_path.display().to_string());
-    prompts.render(PromptId::Plan, &vars, "").trim().to_owned()
+fn plan_text(_plan_path: &Path, prompts: &ResolvedPrompts) -> String {
+    prompts
+        .render(PromptId::Plan, &Vars::new(), "")
+        .trim()
+        .to_owned()
 }
 
 /// The update entering plan mode sends, exactly as the model reads it.
@@ -369,7 +371,7 @@ mod tests {
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]
     #[test_case(|f: &mut LiveFacts| prompt(f).model = "openai/gpt-6".into(), "openai/gpt-6" ; "model")]
     #[test_case(|f: &mut LiveFacts| prompt(f).cwd = "/other".into(), "/other" ; "cwd")]
-    #[test_case(|f: &mut LiveFacts| f.plan = Some(PathBuf::from("/plans/p.md")), "/plans/p.md" ; "plan_on")]
+    #[test_case(|f: &mut LiveFacts| f.plan = Some(PathBuf::from("/plans/p.md")), "# Plan Mode" ; "plan_on")]
     #[test_case(|f: &mut LiveFacts| { prompt(f).hints.insert(HINT_KEY.into(), "tags: c".into()); }, "tags: c" ; "hint_changed")]
     #[test_case(|f: &mut LiveFacts| prompt(f).hints.clear(), HINT_KEY ; "hint_removed")]
     #[test_case(|f: &mut LiveFacts| prompt(f).instructions.clear(), INSTRUCTIONS_GONE ; "instructions_gone")]

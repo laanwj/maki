@@ -282,7 +282,8 @@ pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
-pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+pub(crate) const PLAN_WRITE_RESTRICTED: &str =
+    "plan mode is read-only; draft and refine the plan with plan_write/plan_edit instead";
 /// Whole seconds as `1h1m1s`. Hours are the largest unit, so a day reads `24h`.
 pub fn compact_duration(secs: u64) -> String {
     COMPACT_DURATION.unsigned_duration_to_string(&Duration::from_secs(secs))
@@ -324,6 +325,9 @@ pub struct ToolContext {
     pub model: Arc<Model>,
     pub event_tx: EventSender,
     pub mode: AgentMode,
+    /// The session's plan file, in any mode. What the plan tools write; the
+    /// mode decides only whether the file tools are blocked.
+    pub plan_path: Option<PathBuf>,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
@@ -578,6 +582,7 @@ pub fn interpreter_ctx(
         model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
         mode: mode.clone(),
+        plan_path: mode.plan_path().map(Path::to_path_buf),
         session_id: None,
         background_for: None,
         task_id: None,

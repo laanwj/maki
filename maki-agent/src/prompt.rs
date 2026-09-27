@@ -534,9 +534,10 @@ mod tests {
     #[test_case(PromptId::General, include_str!("prompts/tests/general.md") ; "general")]
     #[test_case(PromptId::Plan, include_str!("prompts/tests/plan.md") ; "plan")]
     fn defaults_preserve_pre_catalogue_bytes(id: PromptId, expected: &str) {
-        let vars = Vars::new()
-            .set("{environment}", "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01")
-            .set("{plan_path}", "/example/plan.md");
+        let vars = Vars::new().set(
+            "{environment}",
+            "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01",
+        );
         assert_eq!(
             ResolvedPrompts::default().render(id, &vars, "\n\nEXAMPLE_INSTRUCTIONS"),
             expected

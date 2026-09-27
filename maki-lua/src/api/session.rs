@@ -745,7 +745,7 @@ fn notify(
 /// @return (boolean|nil, string|nil) true, or nil and an error.
 /// @example
 /// maki.session.set_mode("build", { session = opts.session })
-/// maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = opts.session })
+/// maki.session.prompt("Implement the plan. Read it with plan_read.", { session = opts.session })
 #[lua_fn(guard = SessionSettings)]
 async fn set_mode(
     lua: Lua,

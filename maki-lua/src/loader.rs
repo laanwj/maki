@@ -148,6 +148,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
     BundledPlugin {
+        name: "plan",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/plan"),
+    },
+    BundledPlugin {
         name: "task",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
@@ -1663,6 +1667,10 @@ mod tests {
         .unwrap();
         with_builtin_load(|| brain.load_builtins(&all)).unwrap();
         assert!(brain_reg.has("task"));
+        assert!(
+            brain_reg.has("plan_write"),
+            "the plan file is brain-side state"
+        );
         assert!(!brain_reg.has("read"));
         assert!(
             brain_reg.tool_view("write").is_some(),
@@ -1689,6 +1697,7 @@ mod tests {
         let mut executor = PluginHost::executor(Arc::clone(&executor_reg)).unwrap();
         with_builtin_load(|| executor.load_builtins(&all)).unwrap();
         assert!(executor_reg.has("read"));
+        assert!(!executor_reg.has("plan_write"));
         assert!(
             executor_reg.tool_view("write").is_none(),
             "the executor executes; it never paints"

@@ -139,6 +139,9 @@ const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
 const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
+/// No file path in the prompt: the plan lives on the brain's fs, which the
+/// executor's tools cannot see; plan_read resolves it from the session.
+const IMPLEMENT_READ_HINT: &str = "Read it with plan_read";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
@@ -2661,6 +2664,7 @@ impl App {
             PlanState::Ready(p) => Some((
                 std::fs::read_to_string(&p).unwrap_or_default(),
                 p.display().to_string(),
+                p,
             )),
             _ => None,
         };
@@ -2673,11 +2677,14 @@ impl App {
             vec![]
         };
 
-        let text = if let Some((content, path_str)) = plan_snapshot {
+        let text = if let Some((content, path_str, path)) = plan_snapshot {
+            // reset_session drops the plan; hand it back so the implementing
+            // session's plan tools resolve the file it was drafted in.
+            self.state.plan = PlanState::Ready(path);
             let text = if parallel {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}")
+                format!("{IMPLEMENT_MSG_PREFIX}. {IMPLEMENT_READ_HINT}. {IMPLEMENT_PARALLEL_HINT}")
             } else {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
+                format!("{IMPLEMENT_MSG_PREFIX}. {IMPLEMENT_READ_HINT}.")
             };
             self.main_chat()
                 .push(DisplayMessage::plan(content, path_str));

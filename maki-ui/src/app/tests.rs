@@ -5523,9 +5523,9 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 fn implement_msg(parallel: bool) -> String {
     if parallel {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
+        format!("{IMPLEMENT_MSG_PREFIX}. {IMPLEMENT_READ_HINT}. {IMPLEMENT_PARALLEL_HINT}")
     } else {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
+        format!("{IMPLEMENT_MSG_PREFIX}. {IMPLEMENT_READ_HINT}.")
     }
 }
 
@@ -5620,7 +5620,11 @@ fn plan_form_menu_options(
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
-    assert_eq!(app.state.plan, PlanState::None);
+    assert_eq!(
+        app.state.plan,
+        PlanState::Ready(PathBuf::from("test-plan.md")),
+        "the implementing session keeps the plan file"
+    );
     assert_eq!(
         actions
             .iter()
@@ -5629,9 +5633,10 @@ fn plan_form_menu_options(
     );
     let expected_msg = implement_msg(PlanForm::new().parallel());
     assert_eq!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg)),
+        actions.iter().any(
+            |a| matches!(a, Action::SendMessage(i) if i.message == expected_msg
+                && i.plan_path.as_deref() == Some(Path::new("test-plan.md")))
+        ),
         has_send_message
     );
 }

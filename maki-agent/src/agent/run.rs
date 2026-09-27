@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -152,6 +152,9 @@ pub struct Agent<'h> {
     /// within a run, and not before every request.
     prompt_facts: Option<PromptFacts>,
     mode: AgentMode,
+    /// The session's plan file, refreshed from every input; build mode does
+    /// not clear it.
+    plan_path: Option<PathBuf>,
     user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
@@ -205,6 +208,7 @@ impl<'h> Agent<'h> {
             context: run.context,
             prompt_facts: None,
             mode: AgentMode::default(),
+            plan_path: None,
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
@@ -292,6 +296,7 @@ impl<'h> Agent<'h> {
         let AgentInput {
             message,
             mode,
+            plan_path,
             images,
             preamble,
             earlier,
@@ -305,6 +310,7 @@ impl<'h> Agent<'h> {
         self.carry_from = self.history.len();
         self.stop_continuations = 0;
         self.mode = mode;
+        self.plan_path = plan_path;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
         // Each message of a burst is judged on its own, and one kept message is
@@ -952,6 +958,7 @@ impl<'h> Agent<'h> {
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
+            plan_path: self.plan_path.clone(),
             session_id: self.session_id.clone(),
             background_for: self.background_for,
             task_id: self.task_id.clone(),
@@ -1126,6 +1133,7 @@ impl<'h> Agent<'h> {
                     let message = kept.map(|text| interrupt_message(text, input.images));
                     if message.is_some() {
                         self.mode = input.mode;
+                        self.plan_path = input.plan_path;
                         // The user spoke, so `agent.stop` gets its full
                         // allowance back.
                         self.stop_continuations = 0;
@@ -1281,7 +1289,7 @@ mod tests {
     const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
     const CUSTOM_SYSTEM: &str = "You analyse information.";
     const CUSTOM_CONVENTIONS: &str = "State the evidence and uncertainty.";
-    const CUSTOM_PLAN: &str = "Draft an analysis in {plan_path}.";
+    const CUSTOM_PLAN: &str = "Draft an analysis with plan_write.";
     const FIRST_IDENTITY: &str = "You are the first research assistant.";
     const LAST_IDENTITY: &str = "You are the last research assistant.";
     const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
@@ -1526,6 +1534,7 @@ mod tests {
         AgentInput {
             message: "hello".into(),
             mode: AgentMode::Build,
+            plan_path: None,
             images: Vec::new(),
             preamble: Vec::new(),
             earlier: Vec::new(),
@@ -1777,18 +1786,15 @@ mod tests {
             let messages = requests[1]
                 .messages
                 .iter()
-                .map(Value::to_string)
+                .map(|message| message["content"].to_string())
                 .collect::<String>();
             assert_eq!(messages.matches("Plan mode ACTIVE").count(), 1);
-            assert!(!messages.contains("Draft an analysis in /plans/analysis.md."));
+            assert!(!messages.contains(CUSTOM_PLAN));
+            assert!(!messages.contains("/plans/analysis.md"));
             let updates = updates(&history);
             assert_eq!(updates.len(), 3);
-            assert!(
-                updates
-                    .last()
-                    .unwrap()
-                    .contains("Draft an analysis in /plans/analysis.md.")
-            );
+            assert!(updates.last().unwrap().contains(CUSTOM_PLAN));
+            assert!(!updates.last().unwrap().contains("/plans/analysis.md"));
         });
     }
 
@@ -2418,6 +2424,9 @@ mod tests {
     const NEXT_DATE: &str = "2026-10-03";
     const MEMORY_HINT: &str = "memory/after_instructions";
     const PLAN_FILE: &str = "/plans/p.md";
+    /// The plan-mode update carries the plan text; the path itself stays
+    /// user-facing only, so tests key on the text and the path's absence.
+    const PLAN_ON: &str = "# Plan Mode";
     const SWITCHED_MODEL: &str = "claude-opus-4-1-20250805";
     const PLAN_TOLD_ONCE_MSG: &str =
         "plan mode is in no rendered prompt, so after a compaction it must be told exactly once";
@@ -2561,9 +2570,17 @@ mod tests {
         h.assert_append_only();
         let updates = updates(&h.history);
         assert_eq!(updates.len(), 3);
-        assert!(updates[0].contains(PLAN_FILE));
+        assert!(updates[0].contains(PLAN_ON));
+        assert!(
+            !updates[0].contains(PLAN_FILE),
+            "plan path stays user-facing"
+        );
         assert!(updates[1].contains(PLAN_ENDED));
-        assert!(updates[2].contains(PLAN_FILE));
+        assert!(updates[2].contains(PLAN_ON));
+        assert!(
+            !updates[2].contains(PLAN_FILE),
+            "plan path stays user-facing"
+        );
     }
 
     /// Neither fits in an update. Other tools need another array, and a prompt
@@ -2600,7 +2617,11 @@ mod tests {
 
         let updates = updates(&h.history);
         assert_eq!(updates.len(), 2);
-        assert!(updates[0].contains(PLAN_FILE));
+        assert!(updates[0].contains(PLAN_ON));
+        assert!(
+            !updates[0].contains(PLAN_FILE),
+            "plan path stays user-facing"
+        );
         assert!(updates[1].contains(PLAN_ENDED));
         assert!(!updates[1].contains(NEXT_DATE));
     }
@@ -2928,7 +2949,11 @@ mod tests {
 
         let updates = updates(&h.history);
         assert_eq!(updates.len(), 1, "{PLAN_TOLD_ONCE_MSG}");
-        assert!(updates[0].contains(PLAN_FILE), "{PLAN_TOLD_ONCE_MSG}");
+        assert!(updates[0].contains(PLAN_ON), "{PLAN_TOLD_ONCE_MSG}");
+        assert!(
+            !updates[0].contains(PLAN_FILE),
+            "plan path stays user-facing"
+        );
         let told_at = h
             .history
             .as_slice()
@@ -3010,7 +3035,11 @@ mod tests {
             .iter()
             .position(Message::is_context_update)
             .unwrap();
-        assert!(updates(&h.history)[0].contains(PLAN_FILE));
+        assert!(updates(&h.history)[0].contains(PLAN_ON));
+        assert!(
+            !updates(&h.history)[0].contains(PLAN_FILE),
+            "plan path stays user-facing"
+        );
         assert!(has_interrupt_in_history(&messages[told_at + 1..]));
         let last_request = h.requests.lock().unwrap().last().unwrap().messages.len();
         assert_eq!(last_request, messages.len() - 1, "the update went out");

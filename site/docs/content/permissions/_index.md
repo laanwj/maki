@@ -40,8 +40,6 @@ allow rule matches? ── yes ──►  runs
     │ no
 YOLO active?        ── yes ──►  runs
     │ no
-plan file write?    ── yes ──►  runs
-    │ no
     ▼
 default: prompt / allow / deny
 ```
@@ -49,7 +47,7 @@ default: prompt / allow / deny
 A plugin can answer the prompt in the user's place through the
 [`permission.prompt` slot](/docs/hooks/#permission-prompt).
 
-Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow; this applies to the file-write tools only. All other tools, including MCP tools, follow the check flow below as usual. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or an allow rule. In plan mode, file-write tools are rejected before this flow, even when their target is the plan file. `plan_write` and `plan_edit` are separate fixed-target tools whose routine calls do not prompt. Other tools follow this flow as usual. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
 ## Builtin Defaults
 

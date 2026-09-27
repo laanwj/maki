@@ -172,6 +172,7 @@ impl App {
         inbox.push(AgentInput {
             message: msg.text,
             mode: AgentMode::Build,
+            plan_path: None,
             images: msg.images,
             preamble: Vec::new(),
             earlier: Vec::new(),

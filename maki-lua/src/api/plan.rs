@@ -461,7 +461,7 @@ lua_table! {
     ///     handler = function(opts)
     ///       maki.fn.system({ "git", "commit", "-am", "plan" })
     ///       maki.session.set_mode("build", { session = opts.session })
-    ///       maki.session.prompt("Implement " .. opts.path, { session = opts.session })
+    ///       maki.session.prompt("Implement the plan. Read it with plan_read.", { session = opts.session })
     ///     end,
     ///   })
     ///   return rows

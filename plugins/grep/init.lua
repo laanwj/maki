@@ -201,7 +201,8 @@ maki.api.register_tool({
 - Results grouped by file, sorted by modification time.
 - Prefer speculative parallel searches over sequential rounds of glob+grep.
 - Do NOT wrap the pattern in quotes. Do NOT double-escape (e.g. `\[` not `\\[`).
-- Multi-line matching is auto-enabled when the pattern contains `\n`, `(?s)`, or `(?m)`.]],
+- Multi-line matching is auto-enabled when the pattern contains `\n`, `(?s)`, or `(?m)`.
+- Do not use grep for structural code queries, it's error-prone. Use the `python` tool with `tree_sitter`.]],
 
   schema = {
     type = "object",

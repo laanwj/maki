@@ -1315,6 +1315,22 @@ impl EventHandle {
     }
 }
 
+/// Provider registrations are process-global, so tests that load builtins
+/// take turns: two parallel loads stage the same slug and fail with
+/// `DuplicateSlug`. Each load runs as its own registration generation, as in
+/// production (`cmd::mod::load_plugins`).
+#[cfg(test)]
+pub(crate) fn with_builtin_load<R>(load: impl FnOnce() -> R) -> R {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    maki_providers::plugin::begin_load();
+    let out = load();
+    maki_providers::plugin::commit_load();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,7 +1373,7 @@ mod tests {
     fn with_jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+        with_builtin_load(|| host.load_builtins(&PluginsConfig::from_plugins(HashMap::new())))
             .unwrap();
         assert!(reg.has("glob"));
     }
@@ -1438,7 +1454,7 @@ mod tests {
     #[test]
     fn memory_builtin_registers_command() {
         let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+        let host = with_builtin_load(|| PluginHost::with_all_builtins(Arc::clone(&reg))).unwrap();
         let reader = host.command_reader();
         let snap = reader.load();
         let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
@@ -2231,7 +2247,9 @@ mod bundled_manifests {
     use maki_agent::tools::{ToolRegistry, ToolSource};
     use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
 
-    use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
+    use super::{
+        Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir, with_builtin_load,
+    };
     use crate::docs::{DocKind, api_docs};
     use crate::plugin_permissions::Permission;
 
@@ -2259,7 +2277,7 @@ mod bundled_manifests {
     fn tool_permissions() -> BTreeMap<String, BTreeSet<Permission>> {
         let registry = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::new(Arc::clone(&registry)).expect("host starts");
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+        with_builtin_load(|| host.load_builtins(&PluginsConfig::from_plugins(HashMap::new())))
             .expect("every bundled plugin loads");
 
         let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();

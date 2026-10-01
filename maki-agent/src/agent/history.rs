@@ -5,7 +5,7 @@ use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::next_epoch;
+use maki_storage::sessions::{TitleSource, next_epoch};
 use serde_json::Value;
 use tracing::warn;
 
@@ -197,6 +197,30 @@ impl History {
 
     pub fn as_slice(&self) -> &[Message] {
         &self.snapshot.messages
+    }
+
+    /// The first thing the user typed, kept for the session title: the
+    /// messages may hold a layer's rewrite. First wins; blank counts as
+    /// nothing typed. Published with the messages, so a checkpoint adopts it.
+    pub fn offer_title_source(&mut self, typed: &str) {
+        if self.snapshot.title_source.is_some() {
+            return;
+        }
+        let text = typed.trim();
+        if text.is_empty()
+            || self
+                .as_slice()
+                .iter()
+                .any(|m| m.first_user_text().is_some())
+        {
+            return;
+        }
+        self.snapshot.title_source = Some(text.to_owned());
+        self.publish();
+    }
+
+    pub fn title_source(&self) -> Option<&str> {
+        self.snapshot.title_source.as_deref()
     }
 
     pub fn push(&mut self, msg: Message) {

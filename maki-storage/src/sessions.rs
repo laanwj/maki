@@ -368,6 +368,10 @@ pub struct SessionMeta {
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
     pub messages: Arc<Vec<M>>,
+    /// The first thing the user typed, so the session title can name the
+    /// turn after it even when a layer rewrote the message. Only read while
+    /// the default title stands, so it never reaches the log.
+    pub title_source: Option<String>,
 }
 
 impl<M> HistorySnapshot<M> {
@@ -375,6 +379,7 @@ impl<M> HistorySnapshot<M> {
         Self {
             epoch: next_epoch(),
             messages: Arc::new(messages),
+            title_source: None,
         }
     }
 }
@@ -432,6 +437,11 @@ pub struct Session<M, U, T> {
     /// it changes, every append cursor into the log is void.
     #[serde(skip, default = "next_epoch")]
     epoch: u64,
+    /// The first thing the user typed, so the title can name the turn after
+    /// it even when a layer rewrote the message. Only read while the default
+    /// title stands, so it never reaches the log.
+    #[serde(skip)]
+    pub title_source: Option<String>,
     /// Bumped when this session rewrites a collection in place (replaced
     /// messages, tool outputs or subagent histories). Kept apart from
     /// `epoch` so `set_history` adopting a producer's snapshot can never
@@ -644,12 +654,9 @@ pub fn normalize_title(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
-    let first_user_text = messages.iter().find_map(|m| m.first_user_text());
-
-    let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
-        return DEFAULT_TITLE.into();
-    };
+/// One title's worth of `text`: normalized, then cut to the length limit on a
+/// word boundary.
+fn title_from(text: &str) -> String {
     let text = normalize_title(text);
 
     if text.len() <= MAX_TITLE_LEN {
@@ -1305,6 +1312,7 @@ where
         revision: 0,
         content_revision: 0,
         epoch: next_epoch(),
+        title_source: None,
         rewrites: 0,
     })
 }
@@ -1696,7 +1704,7 @@ where
 
 impl<M, U, T> Session<M, U, T>
 where
-    M: Serialize + DeserializeOwned + TitleSource + Clone,
+    M: Serialize + DeserializeOwned + Clone,
     U: Serialize + DeserializeOwned + Default,
     T: Serialize + DeserializeOwned,
 {
@@ -1723,6 +1731,7 @@ where
             revision: 0,
             content_revision: 0,
             epoch: next_epoch(),
+            title_source: None,
             rewrites: 0,
         }
     }
@@ -1830,6 +1839,7 @@ where
     fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
+        self.title_source = snapshot.title_source.clone();
         self.touch();
     }
 
@@ -1854,8 +1864,8 @@ where
         let session = Arc::make_mut(this);
         if let Some(snapshot) = history {
             session.set_history(snapshot);
-            // The title comes from the messages, so it goes stale exactly when
-            // they move.
+            // The title source rides the snapshot, so the title can only
+            // move when the messages do.
             session.update_title_if_default();
         }
         session.set_meta(meta);
@@ -2109,9 +2119,13 @@ where
         load_session_at(&path)
     }
 
+    /// The source is transient, so a session whose title is still default
+    /// when it has none — a restored one, say — just keeps the default.
     pub fn update_title_if_default(&mut self) {
-        if self.title == DEFAULT_TITLE {
-            self.set_title(generate_title(&self.messages));
+        if self.title == DEFAULT_TITLE
+            && let Some(text) = self.title_source.take()
+        {
+            self.set_title(title_from(&text));
         }
     }
 
@@ -2153,12 +2167,12 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        TAIL_BUF, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch,
+        title_from, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog,
-        SessionMeta, StorageError, TitleSource,
+        SessionMeta, StorageError,
     };
     use crate::StateDir;
     use crate::id::MakiId;
@@ -2187,22 +2201,6 @@ mod tests {
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     const ALL_RECORDED: usize = usize::MAX;
-
-    impl TitleSource for Value {
-        fn first_user_text(&self) -> Option<&str> {
-            if self.get("role")?.as_str()? != "user" {
-                return None;
-            }
-            self.get("content")?.as_array()?.iter().find_map(|b| {
-                if b.get("type")?.as_str()? == "text" {
-                    let text = b.get("text")?.as_str()?;
-                    (!text.is_empty()).then_some(text)
-                } else {
-                    None
-                }
-            })
-        }
-    }
 
     fn user_message(text: &str) -> Value {
         text_message("user", text)
@@ -2550,6 +2548,7 @@ mod tests {
         let run = HistorySnapshot {
             epoch: next_epoch(),
             messages: Arc::new(vec![user_message("hi")]),
+            title_source: None,
         };
         let meta = session.meta.clone();
         Session::checkpoint(&mut session, Some(&run), meta.clone(), Value::Null);
@@ -2562,6 +2561,7 @@ mod tests {
         let advanced = HistorySnapshot {
             epoch: run.epoch,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
+            title_source: None,
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);
         write_through(&mut log, dir, &session);
@@ -3132,20 +3132,42 @@ mod tests {
     }
 
     #[test_case("short title", "short title" ; "short_passthrough")]
-    #[test_case("", DEFAULT_TITLE ; "empty_defaults")]
     #[test_case(
         "This is a very long title that exceeds the sixty character limit and should be truncated at a word boundary",
         "This is a very long title that exceeds the sixty character…"
         ; "long_truncates_at_word"
     )]
     #[test_case("one\n\ntwo\t three", "one two three" ; "whitespace_collapses")]
-    fn title_extraction(input: &str, expected: &str) {
-        let messages: Vec<Value> = if input.is_empty() {
-            vec![]
-        } else {
-            vec![user_message(input)]
+    fn title_from_normalizes_and_truncates(input: &str, expected: &str) {
+        assert_eq!(title_from(input), expected);
+    }
+
+    /// The messages are not consulted: without a source, even a session whose
+    /// messages carry user text keeps the default title.
+    #[test_case(Some("what the user typed"), "what the user typed" ; "typed_text_titles")]
+    #[test_case(None, DEFAULT_TITLE ; "no_source_keeps_the_default_title")]
+    fn update_title_if_default_titles_only_from_the_title_source(
+        source: Option<&str>,
+        expected: &str,
+    ) {
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("the rewrite"));
+        session.title_source = source.map(str::to_owned);
+        session.update_title_if_default();
+        assert_eq!(session.title, expected);
+    }
+
+    #[test]
+    fn checkpoint_adopts_the_snapshots_title_source() {
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let run = HistorySnapshot {
+            epoch: next_epoch(),
+            messages: Arc::new(vec![user_message("the rewrite")]),
+            title_source: Some("what the user typed".into()),
         };
-        assert_eq!(generate_title(&messages), expected);
+        let meta = session.meta.clone();
+        Session::checkpoint(&mut session, Some(&run), meta, Value::Null);
+        assert_eq!(session.title, "what the user typed");
     }
 
     #[test]
@@ -3618,7 +3640,7 @@ mod tests {
     #[test]
     fn title_unicode_safe() {
         let input = "あ".repeat(100);
-        let title = generate_title(&[user_message(&input)]);
+        let title = title_from(&input);
         assert!(title.len() <= MAX_TITLE_LEN * 4);
         assert!(title.is_char_boundary(title.len()));
     }

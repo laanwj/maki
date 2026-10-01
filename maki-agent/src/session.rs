@@ -147,7 +147,7 @@ impl Drop for SessionTurn<'_> {
         if !history.has_unsaved() {
             return;
         }
-        match store.record_turn(history.as_slice(), gauge.size()) {
+        match store.record_turn(history, gauge.size()) {
             Ok(()) => history.mark_saved(),
             // Only headless runs save through here (the TUI has its own
             // writer), so printing cannot tear a drawn frame.
@@ -193,11 +193,13 @@ impl SessionStore {
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
-    fn record_turn(&mut self, messages: &[Message], context_size: u32) -> Result<(), SessionError> {
+    fn record_turn(&mut self, history: &History, context_size: u32) -> Result<(), SessionError> {
+        let messages = history.as_slice();
         if messages.is_empty() {
             return Ok(());
         }
         self.session.replace_messages(messages.to_vec());
+        self.session.title_source = history.title_source().map(str::to_owned);
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
         self.session.save(&self.claim, &self.dir)
@@ -210,7 +212,7 @@ mod tests {
 
     use maki_providers::{ContentBlock, Role};
     use maki_storage::id::MakiId;
-    use maki_storage::sessions::{SESSIONS_DIR, generate_title};
+    use maki_storage::sessions::SESSIONS_DIR;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -223,6 +225,7 @@ mod tests {
     const OTHER_SPEC: &str = "other/model";
     const CONTEXT_SIZE: u32 = 42_000;
     const PROMPT: &str = "fix the login bug";
+    const REWRITE: &str = "the CI log for the login bug";
     const OBSERVATION: &str = "build failed";
     const TITLE: &str = "a title the user set";
     const PLAN_PATH: &str = "/plans/plan.md";
@@ -361,6 +364,7 @@ mod tests {
             Message::observation(OBSERVATION.into()),
         ];
         push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.offer_title_source(PROMPT);
             for message in &messages {
                 params.history.push(message.clone());
             }
@@ -371,7 +375,7 @@ mod tests {
         assert_eq!(loaded.id, session_id());
         assert_eq!(loaded.cwd, CWD);
         assert_eq!(loaded.model, MODEL_SPEC);
-        assert_eq!(loaded.title, generate_title(&messages));
+        assert_eq!(loaded.title, PROMPT);
         assert_eq!(loaded.messages().len(), 2);
         assert!(loaded.messages()[1].is_observation());
         assert_eq!(
@@ -437,6 +441,24 @@ mod tests {
         drop(track);
 
         assert_eq!(load(&tmp).messages().len(), 1, "{RETRIED}");
+    }
+
+    /// `record_turn` is the only writer under a headless driver, so the typed
+    /// text the title names the session after has to travel through it. The
+    /// rewrite stays in the messages, and the title reads the source.
+    #[test]
+    fn a_turn_titles_the_session_from_the_historys_title_source() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.offer_title_source(PROMPT);
+            params.history.push(Message::user(REWRITE.into()));
+        });
+        drop(track);
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.messages()[0].user_text(), Some(REWRITE));
+        assert_eq!(loaded.title, PROMPT);
     }
 
     /// The next process continues the transcript instead of starting one

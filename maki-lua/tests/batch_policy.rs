@@ -1060,9 +1060,9 @@ fn header_click_toggles_all_children() {
 /// and no line numbers read back from disk.
 #[test]
 fn edit_child_body_renders_diff_not_summary() {
-    let (_reg, host) = real_builtins();
+    let (_reg, host, _serial) = real_builtins();
     let lines = restore_snapshot_lines(
-        &host,
+        host,
         json!({ "tool_calls": [{ "tool": "edit", "parameters": {
             "path": "/nonexistent/f",
             "old_string": "let a = 1;",
@@ -1226,9 +1226,9 @@ fn parallel_edits_to_one_file_all_apply() {
     let path = dir.path().join(EDIT_TARGET);
     std::fs::write(&path, format!("{MARKER_A}\n{MARKER_B}\n")).unwrap();
 
-    let (reg, host) = real_builtins();
+    let (reg, host, _serial) = real_builtins();
     let (state, _) = exec_batch_live(
-        &host,
+        host,
         &reg,
         json!([
             edit_call(&path, MARKER_A, EDITED_A),
@@ -1255,9 +1255,9 @@ fn overlapping_parallel_edits_fail_loudly() {
     let path = dir.path().join(EDIT_TARGET);
     std::fs::write(&path, OVERLAP_SOURCE).unwrap();
 
-    let (reg, host) = real_builtins();
+    let (reg, host, _serial) = real_builtins();
     let (state, _) = exec_batch_live(
-        &host,
+        host,
         &reg,
         json!([
             edit_call(&path, OVERLAP_HEAD, OVERLAP_HEAD_NEW),
@@ -1280,10 +1280,26 @@ fn overlapping_parallel_edits_fail_loudly() {
     );
 }
 
-fn real_builtins() -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    (reg, host)
+/// One host for every test in this binary: provider registration is
+/// process-global, so a second `with_all_builtins` fails on slugs the first
+/// one loaded. The mutex serializes callers, since they share one Lua
+/// runtime: a parked child of one batch would otherwise stall a sibling
+/// test's barrier.
+fn real_builtins() -> (
+    Arc<ToolRegistry>,
+    &'static PluginHost,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    static SHARED: std::sync::OnceLock<(Arc<ToolRegistry>, PluginHost)> =
+        std::sync::OnceLock::new();
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = SERIAL.lock().unwrap();
+    let (reg, host) = SHARED.get_or_init(|| {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+        (reg, host)
+    });
+    (Arc::clone(reg), host, guard)
 }
 
 fn edit_call(path: &std::path::Path, old_string: &str, new_string: &str) -> Value {

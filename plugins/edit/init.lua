@@ -7,6 +7,9 @@ local preserve_line_endings = require("edit_helpers").preserve_line_endings
 
 local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 10
+-- A failed multiedit left the file alone, which the raw replace error never
+-- says; the sibling-edit case is the one that surprises.
+local NOTHING_WRITTEN_HINT = "no edits were written"
 
 local DIFF_OLD = { style = "diff_old", prefix = "- ", sign = "diff_old_sign", nr = "diff_old_line_nr" }
 local DIFF_NEW = { style = "diff_new", prefix = "+ ", sign = "diff_new_sign", nr = "diff_new_line_nr" }
@@ -25,6 +28,7 @@ local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 - When copying text from read output, do NOT include the line number prefix (e.g. `42: `) - only the content after it.
 - Prefer this over write for targeted changes - it uses far fewer tokens.
 - Use replace_all for renaming across a file.
+- Never edit the same file in two calls of one batch: each call reads the file as the sibling call left it, not as you last read it. Use one multiedit call instead.
 ]]
 
 local MULTIEDIT_DESCRIPTION = [[Make multiple find-and-replace edits to a single file atomically.
@@ -33,9 +37,8 @@ Prefer this over edit when making multiple changes to the same file.
 - Read the file first to get exact content.
 - Tolerates whitespace and indentation drift in old_string; a match is always one contiguous block, never a partial prefix.
 - Each edit must match exactly once unless replace_all is true. Use replace_all for renaming across a file.
-- Edits are applied in sequence - each operates on the result of the previous.
-- If any edit fails, none are written.
-- Ensure earlier edits don't affect text that later edits need to find.
+- Edits are applied in sequence - each operates on the result of the previous. Ensure earlier edits don't affect text that later edits need to find.
+- Never edit the same file in two calls of one batch: each call reads the file as the sibling call left it, so anchors composed from your last read go stale and the later call fails. Fold all of one file's changes into this call instead.
 ]]
 
 local function edit_header(input)
@@ -367,7 +370,8 @@ register_tool_if(opts.multiedit, {
           if cut then
             snippet = snippet:sub(1, cut - 1) .. "…"
           end
-          return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet, replace_err)
+          return nil,
+            string.format("edits[%d] (old_string %q): %s; %s", i - 1, snippet, replace_err, NOTHING_WRITTEN_HINT)
         end
         content = replaced
       end

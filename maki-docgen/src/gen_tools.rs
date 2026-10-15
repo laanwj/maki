@@ -92,10 +92,7 @@ fn extract_params(schema: &Value) -> Vec<Param> {
 
     let mut params = Vec::new();
     for (name, prop) in properties {
-        let raw_type = prop
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("string");
+        let raw_type = prop.get("type").and_then(|t| t.as_str()).unwrap_or("any");
         let raw_desc = prop
             .get("description")
             .and_then(|d| d.as_str())

@@ -82,6 +82,7 @@ local schema = {
       description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
     },
     output_schema = {
+      type = "object",
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
   },
@@ -121,14 +122,18 @@ local function handler(input, ctx)
     return { llm_output = "unknown subagent type: " .. subagent_type, is_error = true }
   end
 
-  -- Compile early: a bad schema costs zero tokens.
+  -- Compile early: a bad schema costs zero tokens. Models often leave out
+  -- the root type, and tool inputs are always objects, so fill it in
+  -- instead of bouncing the call.
   local validator
-  if input.output_schema then
-    if type(input.output_schema) ~= "table" or input.output_schema.type ~= "object" then
+  local output_schema = input.output_schema
+  if output_schema then
+    if (output_schema.type or "object") ~= "object" then
       return { llm_output = SCHEMA_ROOT_ERROR, is_error = true }
     end
+    output_schema.type = "object"
     local compile_err
-    validator, compile_err = maki.json.schema_validator(input.output_schema)
+    validator, compile_err = maki.json.schema_validator(output_schema)
     if compile_err then
       return { llm_output = SCHEMA_COMPILE_ERROR .. ": " .. compile_err, is_error = true }
     end
@@ -167,7 +172,7 @@ local function handler(input, ctx)
     local_tools = {
       [STRUCTURED_OUTPUT_NAME] = {
         description = STRUCTURED_OUTPUT_DESCRIPTION,
-        input_schema = input.output_schema,
+        input_schema = output_schema,
         handler = function(value)
           local errs = validator:validate(value)
           if errs then

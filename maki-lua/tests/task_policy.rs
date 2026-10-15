@@ -325,8 +325,6 @@ fn multi_error_schema() -> Value {
 #[test_case::test_case(json!({"subagent_type": "bogus"}), UNKNOWN_SUBAGENT_ERR ; "unknown_subagent_type")]
 #[test_case::test_case(json!({"output_schema": {"type": "object", "properties": {"x": {"type": 42}}}}), SCHEMA_COMPILE_ERROR ; "invalid_output_schema")]
 #[test_case::test_case(json!({"output_schema": {"type": "array"}}), SCHEMA_ROOT_ERROR ; "non_object_output_schema")]
-#[test_case::test_case(json!({"output_schema": "not an object"}), SCHEMA_ROOT_ERROR ; "non_table_output_schema")]
-#[test_case::test_case(json!({"output_schema": {"description": "missing type"}}), SCHEMA_ROOT_ERROR ; "output_schema_missing_type")]
 fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
@@ -340,15 +338,18 @@ fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     assert_eq!(snap["prompt_count"], json!(0));
 }
 
-#[test]
-fn structured_happy_path_returns_validated_json() {
+fn typeless_answer_schema() -> Value {
+    let mut schema = answer_schema();
+    schema.as_object_mut().unwrap().remove("type");
+    schema
+}
+
+#[test_case::test_case(answer_schema() ; "typed_root")]
+#[test_case::test_case(typeless_answer_schema() ; "missing_root_type_defaults_to_object")]
+fn structured_happy_path_returns_validated_json(schema: Value) {
     let (reg, _host) = load_task_host();
-    let out = exec_tool(
-        &reg,
-        TASK_TOOL,
-        task_input(SCENARIO_HAPPY, Some(answer_schema())),
-    )
-    .expect("structured task failed");
+    let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_HAPPY, Some(schema)))
+        .expect("structured task failed");
     let parsed: Value = serde_json::from_str(&out).expect("result is not json");
     assert_eq!(parsed, json!({ "answer": "42" }));
 

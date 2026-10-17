@@ -44,7 +44,7 @@ pub use pack::{
 pub use plugin_permissions::{Missing, Permission, PluginPermissions, PluginReach, Requested};
 pub use runtime::{
     KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
-    RestoreItem, RestoreReason, WARM_TOOL_CAP,
+    RestoreItem, RestoreReason, WARM_TOOL_BYTES, WARM_TOOL_CAP,
 };
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 

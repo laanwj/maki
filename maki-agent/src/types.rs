@@ -899,6 +899,18 @@ impl SharedBuf {
             .len()
     }
 
+    /// Bytes of rendered text across all lines. The snapshot's spans are the
+    /// same strings the view carries on the Lua side, so this stands in for
+    /// what the buf actually costs wherever a byte budget is needed.
+    pub fn text_bytes(&self) -> usize {
+        self.committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.text.len()).sum::<usize>())
+            .sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

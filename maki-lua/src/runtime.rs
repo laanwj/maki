@@ -857,13 +857,42 @@ pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
 type LiveTasks = Rc<RefCell<HashMap<String, TaskHandle>>>;
 type WarmTools = Rc<RefCell<VecDeque<WarmTool>>>;
 
+/// Budget the warm cache holds across its entries, counted as each entry's
+/// rendered output text plus every buf its task created — the click closure
+/// pins a view over both, at ~an order of magnitude over their text, which
+/// is why the budget sits well under the VM cap. A body that alone busts
+/// the budget is never warmed (its clicks take the restore fallback), so a
+/// monster result can never pin its task's whole buf store.
+pub const WARM_TOOL_BYTES: usize = 8 * 1024 * 1024;
+
 /// A finished tool that still answers clicks. `handle` is a fresh cell
 /// holding only the root buf; `_claim` keeps the buf handler slots alive
 /// (they normally clear at scope drop) until this entry is evicted.
+/// `bytes` is what the entry pins: the task's output text plus its bufs.
 struct WarmTool {
     id: String,
     handle: TaskHandle,
+    bytes: usize,
     _claim: Arc<BufsClaim>,
+}
+
+fn push_warm(warm: &WarmTools, tool: WarmTool) {
+    // A body that alone busts the budget would pin its task's whole buf
+    // store for as long as it stays warm, and the VM pays an order of
+    // magnitude over its text for the view: never warm one.
+    if tool.bytes > WARM_TOOL_BYTES {
+        return;
+    }
+    let mut warm = warm.borrow_mut();
+    let over_budget = |q: &VecDeque<WarmTool>| {
+        q.len() > WARM_TOOL_CAP || q.iter().map(|t| t.bytes).sum::<usize>() > WARM_TOOL_BYTES
+    };
+    warm.push_back(tool);
+    while over_budget(&warm) {
+        if warm.pop_front().is_none() {
+            break;
+        }
+    }
 }
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
@@ -4387,23 +4416,26 @@ async fn run_tool_call(
     if let Some(id) = &live_id {
         live_tasks.borrow_mut().remove(id);
         // Best-effort cache: any tool with a root buf can serve clicks.
-        // Warming a tool the UI never watches is harmless because its
-        // clicks arrive as restore requests, which evict the entry.
+        // Warming a tool the UI never watches is harmless: its clicks
+        // arrive as restore requests, which evict the entry, and push_warm
+        // bounds the total bytes so unclicked entries cannot accumulate.
         if let Some(root) = resolve_root_buf(&handle) {
             // A fresh cell, because the original's cancel token and
             // deadline are stale: the watchdog interrupt would use them to
             // kill warm clicks.
+            let bytes =
+                lock_cell(&handle).bufs.text_bytes() + reply.result.as_deref().map_or(0, str::len);
             let mut cell = TaskCell::new(CancelToken::none(), None, None);
-            cell.root_buf = Some(root);
-            let mut warm = warm_tools.borrow_mut();
-            warm.push_back(WarmTool {
-                id: id.clone(),
-                handle: Arc::new(Mutex::new(cell)),
-                _claim: scope.bufs_claim(),
-            });
-            if warm.len() > WARM_TOOL_CAP {
-                warm.pop_front();
-            }
+            cell.root_buf = Some(Arc::clone(&root));
+            push_warm(
+                &warm_tools,
+                WarmTool {
+                    id: id.clone(),
+                    handle: Arc::new(Mutex::new(cell)),
+                    bytes,
+                    _claim: scope.bufs_claim(),
+                },
+            );
         }
     }
     drop(scope);

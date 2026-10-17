@@ -26,7 +26,7 @@ use maki_config::{
 use maki_lua::{
     InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, Missing, NO_UI_ERR,
     PERMISSION_NAME_WARNING, PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING,
-    SessionEndReason, WARM_TOOL_CAP, set_allowed_private_hosts,
+    SessionEndReason, WARM_TOOL_BYTES, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -2293,6 +2293,182 @@ fn warm_fifo_evicts_oldest_runtime_side() {
         bufs[0].read()[0].spans[0].text,
         WARM_INITIAL_LINE,
         "evicted tool's click must be ignored"
+    );
+}
+
+/// The count cap is not the whole budget: two tools whose bodies together
+/// pass [`WARM_TOOL_BYTES`] evict the oldest, well before the count cap
+/// fills. Monster results may never take the warm path at all.
+#[test]
+fn warm_byte_budget_evicts_oldest_before_count_cap() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{WARM_TOOL_NAME}",
+            description = "big body warm probe",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ string.rep("x", {}) }})
+                buf:on("click", function()
+                    buf:set_lines({{ "{WARM_CLICK_LINE}" }})
+                end)
+                ctx:live_buf(buf)
+                return "done"
+            end,
+            restore = function(input, output, is_error, rctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ "{WARM_RESTORED_LINE}" }})
+                buf:on("click", function()
+                    buf:set_lines({{ "{WARM_RESTORE_CLICK_LINE}" }})
+                end)
+                return {{ body = buf }}
+            end
+        }})"#,
+        // Two bodies together exceed the budget, one alone stays under it.
+        WARM_TOOL_BYTES / 2 + 1024,
+    );
+    host.load_source("warm_probe_plugin", &src).unwrap();
+
+    let mut bufs = Vec::with_capacity(2);
+    for id in ["t0", "t1"] {
+        let (ctx, rx) = warm_ctx(id);
+        exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+        bufs.push(recv_live_buf(&rx, id).expect("live buf published"));
+    }
+
+    let eh = host.event_handle();
+    eh.request_click("t1".to_owned(), 0);
+    eh.request_click("t0".to_owned(), 0);
+    barrier(&host);
+
+    let big = "x".repeat(WARM_TOOL_BYTES / 2 + 1024);
+    assert_eq!(
+        bufs[1].read()[0].spans[0].text,
+        WARM_CLICK_LINE,
+        "the newest body must stay warm under the budget"
+    );
+    assert_eq!(
+        bufs[0].read()[0].spans[0].text,
+        big,
+        "the body that pushed the pair over the budget must be evicted"
+    );
+}
+
+/// A body whose text alone busts the budget must never enter the warm
+/// cache: it would pin its task's whole buf store for as long as it
+/// stays warm, and its view costs the VM an order of magnitude over its
+/// text. Its clicks take the restore fallback instead.
+#[test]
+fn warm_body_over_budget_is_never_warmed() {
+    const WARM_ID: &str = "warm-monster-1";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{WARM_TOOL_NAME}",
+            description = "monster body warm probe",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ string.rep("x", {}) }})
+                buf:on("click", function()
+                    buf:set_lines({{ "{WARM_CLICK_LINE}" }})
+                end)
+                ctx:live_buf(buf)
+                return "done"
+            end,
+            restore = function(input, output, is_error, rctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ "{WARM_RESTORED_LINE}" }})
+                buf:on("click", function()
+                    buf:set_lines({{ "{WARM_RESTORE_CLICK_LINE}" }})
+                end)
+                return {{ body = buf }}
+            end
+        }})"#,
+        WARM_TOOL_BYTES + 1024,
+    );
+    host.load_source("warm_monster_plugin", &src).unwrap();
+
+    let (ctx, rx) = warm_ctx(WARM_ID);
+    exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+    recv_live_buf(&rx, WARM_ID).expect("live buf published");
+
+    let (fb_tx, fb_rx) = flume::unbounded();
+    let eh = host.event_handle();
+    eh.request_click_with_fallback(
+        WARM_ID.to_owned(),
+        0,
+        warm_restore_item(WARM_ID, vec![0]),
+        maki_agent::EventSender::new(fb_tx, 0),
+    );
+    barrier(&host);
+
+    assert_eq!(
+        snapshot_texts(&fb_rx, WARM_ID),
+        vec![WARM_RESTORE_CLICK_LINE.to_owned()],
+        "a body over the budget must not be warmed; its click must take the restore fallback"
+    );
+}
+
+/// The executor leak shape: a tiny root buf whose click closure pins a
+/// view over a huge rendered output. The buf text barely counts; the
+/// output text is what the entry would pin, so the budget counts both.
+#[test]
+fn warm_output_over_budget_is_never_warmed() {
+    const WARM_ID: &str = "warm-monster-out-1";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{WARM_TOOL_NAME}",
+            description = "monster output warm probe",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ "{WARM_INITIAL_LINE}" }})
+                buf:on("click", function()
+                    buf:set_lines({{ "{WARM_CLICK_LINE}" }})
+                end)
+                ctx:live_buf(buf)
+                return string.rep("y", {})
+            end,
+            restore = function(input, output, is_error, rctx)
+                local buf = maki.ui.buf()
+                buf:set_lines({{ "{WARM_RESTORED_LINE}" }})
+                buf:on("click", function()
+                    buf:set_lines({{ "{WARM_RESTORE_CLICK_LINE}" }})
+                end)
+                return {{ body = buf }}
+            end
+        }})"#,
+        WARM_TOOL_BYTES + 1024,
+    );
+    host.load_source("warm_monster_out_plugin", &src).unwrap();
+
+    let (ctx, rx) = warm_ctx(WARM_ID);
+    exec_warm_tool(&reg, WARM_TOOL_NAME, &ctx).expect("tool output");
+    recv_live_buf(&rx, WARM_ID).expect("live buf published");
+
+    let (fb_tx, fb_rx) = flume::unbounded();
+    let eh = host.event_handle();
+    eh.request_click_with_fallback(
+        WARM_ID.to_owned(),
+        0,
+        warm_restore_item(WARM_ID, vec![0]),
+        maki_agent::EventSender::new(fb_tx, 0),
+    );
+    barrier(&host);
+
+    assert_eq!(
+        snapshot_texts(&fb_rx, WARM_ID),
+        vec![WARM_RESTORE_CLICK_LINE.to_owned()],
+        "an output over the budget must not pin its view in the warm cache; the click must fall back to restore"
     );
 }
 

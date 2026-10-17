@@ -70,6 +70,13 @@ impl BufferStore {
         handle
     }
 
+    /// Total committed text across every buf the task created: what a warm
+    /// entry actually pins through its claim, and the cost the warm budget
+    /// counts.
+    pub fn text_bytes(&self) -> usize {
+        self.buffers.values().map(|b| b.text_bytes()).sum()
+    }
+
     #[cfg(test)]
     pub fn append_line(&mut self, id: u32, line: SnapshotLine) {
         if let Some(buf) = self.buffers.get(&id) {

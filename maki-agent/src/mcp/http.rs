@@ -18,7 +18,7 @@ use smol::lock::Mutex;
 use super::error::McpError;
 use super::oauth;
 use super::protocol::{JsonRpcError, JsonRpcNotification, JsonRpcRequest};
-use super::transport::{BoxFuture, McpTransport};
+use super::transport::{BoxFuture, CancelNotify, McpTransport};
 use tracing::{info, warn};
 
 const MAX_REDIRECTS: u32 = 10;
@@ -35,10 +35,10 @@ pub struct HttpTransport {
     url: String,
     client: HttpClient,
     headers: HashMap<String, String>,
-    auth: Mutex<Option<String>>,
+    auth: Arc<Mutex<Option<String>>>,
     storage: Option<StateDir>,
     ca_file: Option<PathBuf>,
-    negotiated: Mutex<Negotiated>,
+    negotiated: Arc<Mutex<Negotiated>>,
     next_id: AtomicU64,
 }
 
@@ -110,10 +110,10 @@ impl HttpTransport {
             url: url.to_string(),
             client,
             headers,
-            auth: Mutex::new(auth),
+            auth: Arc::new(Mutex::new(auth)),
             storage,
             ca_file: ca_file.map(Path::to_path_buf),
-            negotiated: Mutex::new(Negotiated::default()),
+            negotiated: Arc::new(Mutex::new(Negotiated::default())),
             next_id: AtomicU64::new(1),
         })
     }
@@ -129,32 +129,15 @@ impl HttpTransport {
         negotiated: &Negotiated,
         auth: Option<&str>,
     ) -> Result<Request<Vec<u8>>, McpError> {
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(&self.url)
-            .header(CONTENT_TYPE, CT_JSON)
-            .header(ACCEPT, ACCEPT_VALUE);
-
-        if let Some(sid) = &negotiated.session_id {
-            builder = builder.header(SESSION_HEADER, sid);
-        }
-
-        if let Some(version) = &negotiated.protocol_version {
-            builder = builder.header(PROTOCOL_HEADER, version);
-        }
-
-        if let Some(auth) = auth {
-            builder = builder.header(AUTHORIZATION, auth);
-        }
-
-        for (k, v) in &self.headers {
-            builder = builder.header(k.as_str(), v.as_str());
-        }
-
-        builder.body(body).map_err(|e| McpError::InvalidResponse {
-            server: self.server(),
-            reason: e.to_string(),
-        })
+        build_mcp_request(
+            &self.server(),
+            &self.url,
+            &self.headers,
+            method,
+            body,
+            negotiated,
+            auth,
+        )
     }
 
     async fn send_http(
@@ -237,6 +220,56 @@ impl HttpTransport {
             }
         }
     }
+
+    /// This transport's [`CancelNotify`]: one best-effort POST of the cancel
+    /// notification, reading the live auth and session state at fire time so
+    /// a mid-request token refresh is not missed.
+    fn cancel_notify(&self, id: u64) -> CancelNotify {
+        let name = Arc::clone(&self.name);
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let headers = self.headers.clone();
+        let auth = Arc::clone(&self.auth);
+        let negotiated = Arc::clone(&self.negotiated);
+        CancelNotify::armed(move || {
+            smol::spawn(async move {
+                let body = match serde_json::to_vec(&JsonRpcNotification::cancelled(id)) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        warn!(server = &*name, error = %e, "serialize cancel notification failed");
+                        return;
+                    }
+                };
+                // Read the live state, then release before sending: the lock
+                // must not sit across the POST (the refresh path holds it
+                // across a token exchange).
+                let (auth, negotiated) = {
+                    let auth = auth.lock().await.clone();
+                    let negotiated = negotiated.lock().await.clone();
+                    (auth, negotiated)
+                };
+                let Ok(http_req) = build_mcp_request(
+                    &name,
+                    &url,
+                    &headers,
+                    Method::POST,
+                    body,
+                    &negotiated,
+                    auth.as_deref(),
+                ) else {
+                    warn!(
+                        server = &*name,
+                        "failed to build cancel notification request"
+                    );
+                    return;
+                };
+                if let Err(e) = client.send_async(http_req).await {
+                    warn!(server = &*name, error = %e, "failed to send cancel notification");
+                }
+            })
+            .detach();
+        })
+    }
 }
 
 impl McpTransport for HttpTransport {
@@ -258,6 +291,10 @@ impl McpTransport for HttpTransport {
 
             let mut auth = self.auth.lock().await.clone();
             let mut refreshed = false;
+
+            // Armed until a reply for our id lands; the 401 retry re-POSTs the
+            // same id under the same guard.
+            let mut cancel_notify = self.cancel_notify(id);
 
             loop {
                 let negotiated = self.negotiated.lock().await.clone();
@@ -300,6 +337,13 @@ impl McpTransport for HttpTransport {
                     .is_some_and(|ct| ct.contains(CT_SSE));
 
                 let result = self.parse_rpc_response(&body_str, is_sse, id);
+
+                // A reply the server sent for our id ends the request,
+                // whatever it says: a cancel after an answer is noise.
+                match &result {
+                    Ok(_) | Err(McpError::RpcError { .. }) => cancel_notify.disarm(),
+                    Err(_) => {}
+                }
 
                 {
                     let mut negotiated = self.negotiated.lock().await;
@@ -376,6 +420,47 @@ impl McpTransport for HttpTransport {
     fn transport_kind(&self) -> &'static str {
         "http"
     }
+}
+
+/// One MCP HTTP request, framed the way every request the transport sends is
+/// framed: content type, accept, the negotiated session and protocol version
+/// headers, the Authorization header, and the configured extras.
+#[allow(clippy::too_many_arguments)]
+fn build_mcp_request(
+    server: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    method: Method,
+    body: Vec<u8>,
+    negotiated: &Negotiated,
+    auth: Option<&str>,
+) -> Result<Request<Vec<u8>>, McpError> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(url)
+        .header(CONTENT_TYPE, CT_JSON)
+        .header(ACCEPT, ACCEPT_VALUE);
+
+    if let Some(sid) = &negotiated.session_id {
+        builder = builder.header(SESSION_HEADER, sid);
+    }
+
+    if let Some(version) = &negotiated.protocol_version {
+        builder = builder.header(PROTOCOL_HEADER, version);
+    }
+
+    if let Some(auth) = auth {
+        builder = builder.header(AUTHORIZATION, auth);
+    }
+
+    for (k, v) in headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+
+    builder.body(body).map_err(|e| McpError::InvalidResponse {
+        server: server.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 fn find_response(messages: Vec<Value>, id: u64, server: &str) -> Result<Value, McpError> {
@@ -595,6 +680,95 @@ mod tests {
         );
     }
 
+    /// An abandoned request must tell the server: the caller's cancel races
+    /// the call away, and without a `notifications/cancelled` the server
+    /// runs the call to completion. The fire reads the live auth and session
+    /// state, so a value that landed mid-request rides along.
+    #[test]
+    fn abandoned_request_sends_cancel_notification() {
+        let (posted_tx, posted_rx) = smol::channel::bounded::<Value>(1);
+        let (cancel_tx, cancel_rx) = smol::channel::bounded::<Value>(1);
+        let url = spawn_server(move |_base| {
+            move |req: &Req| {
+                let msg: Value = match serde_json::from_str(&req.body) {
+                    Ok(msg) => msg,
+                    Err(_) => return (400, String::new()),
+                };
+                match msg["method"].as_str() {
+                    Some("tools/call") => {
+                        posted_tx.try_send(json!({ "id": msg["id"] })).unwrap();
+                        // Park the response so the call stays in flight; the
+                        // thread dies with the test process.
+                        std::thread::sleep(PENDING_REQUEST_TIMEOUT);
+                        (200, rpc_ok(msg["id"].as_u64().unwrap_or_default()))
+                    }
+                    Some("notifications/cancelled") => {
+                        cancel_tx
+                            .try_send(json!({
+                                "requestId": msg["params"]["requestId"],
+                                "authorization": req.auth,
+                                "session": req.headers.get("mcp-session-id"),
+                                "custom": req.headers.get("x-maki-test"),
+                            }))
+                            .unwrap();
+                        (202, String::new())
+                    }
+                    _ => (404, String::new()),
+                }
+            }
+        });
+
+        let transport = Arc::new(transport_with(
+            &url,
+            HashMap::from([("x-maki-test".to_string(), "rides-along".to_string())]),
+            None,
+        ));
+        smol::block_on(async {
+            // A session header only rides after initialize; set it directly so
+            // the fire path is observable without the handshake.
+            *transport.negotiated.lock().await = Negotiated {
+                session_id: Some("sess-1".into()),
+                protocol_version: None,
+            };
+
+            // The call races a cancel token, the way execute_mcp_tool runs
+            // it, on a task of its own: the raced future is lazy, and the
+            // cancel has to land while it is in flight.
+            let (trigger, token) = crate::cancel::CancelToken::new();
+            let call = {
+                let transport = Arc::clone(&transport);
+                smol::spawn(async move {
+                    token
+                        .race(async move {
+                            transport
+                                .send_request("tools/call", Some(json!({ "name": "t" })))
+                                .await
+                        })
+                        .await
+                })
+            };
+
+            let posted = posted_rx.recv().await.unwrap();
+            // Change the auth mid-flight: the fire must read it live, not a
+            // snapshot from before the request.
+            *transport.auth.lock().await = Some("Bearer fresh".into());
+            trigger.cancel();
+            let result = call.await;
+            assert!(result.is_err(), "raced request should report cancelled");
+
+            let cancel =
+                futures_lite::future::or(async { cancel_rx.recv().await.unwrap() }, async {
+                    smol::Timer::after(Duration::from_secs(5)).await;
+                    panic!("cancel notification POST never arrived");
+                })
+                .await;
+            assert_eq!(cancel["requestId"], posted["id"]);
+            assert_eq!(cancel["authorization"], "Bearer fresh");
+            assert_eq!(cancel["session"], "sess-1");
+            assert_eq!(cancel["custom"], "rides-along");
+        });
+    }
+
     fn rpc_ok(id: u64) -> String {
         format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"ok":true}}}}"#)
     }
@@ -603,6 +777,9 @@ mod tests {
         path: String,
         auth: Option<String>,
         protocol: Option<String>,
+        /// Every header, keyed by lowercased name with the original value.
+        headers: HashMap<String, String>,
+        body: String,
     }
 
     fn spawn_server<F>(make_handler: impl FnOnce(String) -> F) -> String
@@ -631,8 +808,7 @@ mod tests {
                     }
 
                     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
-                    let mut auth = None;
-                    let mut protocol = None;
+                    let mut headers: HashMap<String, String> = HashMap::new();
                     let mut content_length = 0usize;
 
                     loop {
@@ -644,15 +820,18 @@ mod tests {
 
                         let lower = header.to_ascii_lowercase();
 
-                        if let Some(v) = lower.strip_prefix("authorization:") {
-                            let start = header.len() - v.len();
-                            auth = Some(header[start..].trim().to_string());
-                        } else if let Some(v) = lower.strip_prefix("content-length:") {
+                        if let Some((name, value)) = lower.split_once(':') {
+                            let value = &header[header.len() - value.len()..];
+                            headers.insert(name.to_string(), value.trim().to_string());
+                        }
+
+                        if let Some(v) = lower.strip_prefix("content-length:") {
                             content_length = v.trim().parse().unwrap_or(0);
-                        } else if let Some(v) = lower.strip_prefix("mcp-protocol-version:") {
-                            protocol = Some(v.trim().to_string());
                         }
                     }
+
+                    let auth = headers.get("authorization").cloned();
+                    let protocol = headers.get("mcp-protocol-version").cloned();
 
                     let mut body = vec![0u8; content_length];
                     let _ = std::io::Read::read_exact(&mut reader, &mut body);
@@ -661,6 +840,8 @@ mod tests {
                         path,
                         auth,
                         protocol,
+                        headers,
+                        body: String::from_utf8_lossy(&body).into_owned(),
                     });
 
                     let response = format!(

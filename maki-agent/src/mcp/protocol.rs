@@ -39,6 +39,16 @@ impl<'a> JsonRpcNotification<'a> {
             params,
         }
     }
+
+    /// `notifications/cancelled` for {request_id}: the message a client owes
+    /// a server when a request ends without anyone left to read the reply.
+    pub fn cancelled(request_id: u64) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: "notifications/cancelled",
+            params: Some(serde_json::json!({ "requestId": request_id })),
+        }
+    }
 }
 
 #[derive(Deserialize)]

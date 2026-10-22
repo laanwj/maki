@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use super::error::McpError;
 use super::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use super::transport::CancelNotify;
 
 pub(crate) type PendingMap = HashMap<u64, channel::Sender<Result<Value, McpError>>>;
 
@@ -20,7 +21,7 @@ const LINE_DELIMITER: u8 = b'\n';
 pub struct LineTransport<W> {
     name: Arc<str>,
     kind: &'static str,
-    writer: Mutex<W>,
+    writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<PendingMap>>,
     next_id: AtomicU64,
     timeout: Duration,
@@ -64,7 +65,7 @@ where
         Self {
             name,
             kind,
-            writer: Mutex::new(writer),
+            writer: Arc::new(Mutex::new(writer)),
             pending,
             next_id: AtomicU64::new(1),
             timeout,
@@ -90,18 +91,28 @@ where
             return Err(e);
         }
 
-        let result = futures_lite::future::race(
-            async { rx.recv().await.unwrap_or(Err(self.server_died())) },
-            async {
-                smol::Timer::after(self.timeout).await;
-                Err(McpError::Timeout {
-                    server: self.server(),
-                    timeout_ms: self.timeout.as_millis() as u64,
-                })
-            },
-        )
+        let recv = async { rx.recv().await.unwrap_or(Err(self.server_died())) };
+        // Armed until a reply for our id lands: a dropped future (the
+        // caller's cancel raced us away) or a failed attempt leaves the
+        // request running server-side unless we tell the server it was
+        // cancelled.
+        let mut cancel_notify = self.cancel_notify(id);
+        let result = futures_lite::future::race(recv, async {
+            smol::Timer::after(self.timeout).await;
+            Err(McpError::Timeout {
+                server: self.server(),
+                timeout_ms: self.timeout.as_millis() as u64,
+            })
+        })
         .await;
 
+        // A reply the server sent for our id ends the request, whatever it
+        // says: a cancel after an answer is noise. Everything else keeps the
+        // guard armed; a dead reader is skipped inside the fire.
+        match &result {
+            Ok(_) | Err(McpError::RpcError { .. }) => cancel_notify.disarm(),
+            Err(_) => {}
+        }
         if result.is_err() {
             self.pending.lock().await.remove(&id);
         } else {
@@ -136,6 +147,41 @@ where
         writer.flush().await.map_err(|e| McpError::WriteFailed {
             server: self.server(),
             reason: e.to_string(),
+        })
+    }
+
+    /// This transport's [`CancelNotify`]: one more ndjson line on the
+    /// connection's writer, unless the reader has already died.
+    fn cancel_notify(&self, id: u64) -> CancelNotify {
+        let name = Arc::clone(&self.name);
+        let kind = self.kind;
+        let writer = Arc::clone(&self.writer);
+        let alive = Arc::clone(&self.alive);
+        CancelNotify::armed(move || {
+            if !alive.load(Ordering::Acquire) {
+                return;
+            }
+            smol::spawn(async move {
+                let buf = match serde_json::to_vec(&JsonRpcNotification::cancelled(id)) {
+                    Ok(mut buf) => {
+                        buf.push(LINE_DELIMITER);
+                        buf
+                    }
+                    Err(e) => {
+                        warn!(server = &*name, transport = kind, error = %e, "serialize cancel notification failed");
+                        return;
+                    }
+                };
+                let mut writer = writer.lock().await;
+                if let Err(e) = writer.write_all(&buf).await {
+                    warn!(server = &*name, transport = kind, error = %e, "failed to send cancel notification");
+                    return;
+                }
+                if let Err(e) = writer.flush().await {
+                    warn!(server = &*name, transport = kind, error = %e, "failed to flush cancel notification");
+                }
+            })
+            .detach();
         })
     }
 

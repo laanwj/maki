@@ -134,6 +134,40 @@ pub struct McpCallOutput {
     pub image: Option<maki_providers::ImageSource>,
 }
 
+/// Fires a transport's best-effort `notifications/cancelled` when a request
+/// ends without a reply: the caller dropped the future mid-await (its own
+/// cancel raced the call away), or the attempt failed. The server decides
+/// what cancellation means; without the notification it has no way to learn
+/// the call is dead and runs it to completion.
+///
+/// A transport's `send_request` arms one per request id with a closure that
+/// knows how that transport sends a single notification, and disarms it when
+/// a reply for the id arrives — whatever the reply says.
+pub(crate) struct CancelNotify {
+    fire: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl CancelNotify {
+    pub(crate) fn armed(fire: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            fire: Some(Box::new(fire)),
+        }
+    }
+
+    /// The server answered our id: the request is over, tell it nothing.
+    pub(crate) fn disarm(&mut self) {
+        self.fire = None;
+    }
+}
+
+impl Drop for CancelNotify {
+    fn drop(&mut self) {
+        if let Some(fire) = self.fire.take() {
+            fire();
+        }
+    }
+}
+
 pub async fn call_tool(
     transport: &dyn McpTransport,
     tool_name: &str,
@@ -176,6 +210,7 @@ pub async fn call_tool(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use test_case::test_case;
 
     #[test_case(json!({"capabilities": {"tools": {}, "prompts": {}, "resources": {}}}), true, true, true ; "all")]
@@ -189,5 +224,28 @@ mod tests {
             (caps.tools, caps.prompts, caps.resources),
             (tools, prompts, resources)
         );
+    }
+
+    fn counter_guard(fired: &Arc<AtomicUsize>) -> CancelNotify {
+        let counter = Arc::clone(fired);
+        CancelNotify::armed(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    #[test]
+    fn cancel_notify_fires_when_armed() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        drop(counter_guard(&fired));
+        assert_eq!(fired.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn disarmed_cancel_notify_stays_silent() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let mut guard = counter_guard(&fired);
+        guard.disarm();
+        drop(guard);
+        assert_eq!(fired.load(Ordering::Relaxed), 0);
     }
 }

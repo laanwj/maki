@@ -1013,6 +1013,52 @@ mod tests {
     }
 
     #[test]
+    fn grep_search_max_lines_truncates_merged_context() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dense.rs");
+        let content = (1..=10).map(|_| "hit").collect::<Vec<_>>().join("\n");
+        fs::write(&path, content).unwrap();
+
+        let mut params = grep::GrepParams::new("hit".into());
+        params.path = Some(path.to_string_lossy().into());
+        params.context_before = 1;
+        params.context_after = 1;
+        params.max_lines = Some(4);
+        let (_, entries) = grep::grep_search(params).unwrap();
+
+        let total_lines: usize = entries
+            .iter()
+            .flat_map(|entry| &entry.groups)
+            .map(|group| group.lines.len())
+            .sum();
+        assert_eq!(total_lines, 4);
+        assert_eq!(entries[0].groups.len(), 1);
+        assert!(entries[0].groups[0].lines.iter().any(|line| line.is_match));
+    }
+
+    #[test]
+    fn grep_search_max_lines_preserves_match_over_leading_context() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sparse.rs");
+        let context = (1..=10)
+            .map(|i| format!("context {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{context}\nhit")).unwrap();
+
+        let mut params = grep::GrepParams::new("hit".into());
+        params.path = Some(path.to_string_lossy().into());
+        params.context_before = 10;
+        params.max_lines = Some(1);
+        let (_, entries) = grep::grep_search(params).unwrap();
+
+        let lines = &entries[0].groups[0].lines;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].is_match);
+        assert_eq!(lines[0].text, "hit");
+    }
+
+    #[test]
     fn grep_search_parallel_stable_under_repeated_calls() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();

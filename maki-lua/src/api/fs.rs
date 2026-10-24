@@ -866,7 +866,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 /// `lines`, where every line has `line_nr`, `text`, and `is_match`.
 ///
 /// @param pattern string Regular expression to search for.
-/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_lines` (integer): max total lines. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 /// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
 /// @example
 /// local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
@@ -896,6 +896,9 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         }
         if let Ok(v) = opts.get::<usize>("limit") {
             params.limit = v;
+        }
+        if let Ok(v) = opts.get::<usize>("max_lines") {
+            params.max_lines = Some(v);
         }
         if let Ok(v) = opts.get::<usize>("max_line_bytes") {
             params.max_line_bytes = v;

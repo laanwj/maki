@@ -27,6 +27,7 @@ pub struct GrepParams {
     pub context_before: usize,
     pub context_after: usize,
     pub limit: usize,
+    pub max_lines: Option<usize>,
     pub max_line_bytes: usize,
 }
 
@@ -39,6 +40,7 @@ impl GrepParams {
             context_before: 0,
             context_after: 0,
             limit: 100,
+            max_lines: None,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
         }
     }
@@ -89,6 +91,7 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
         search
     };
     let has_context = params.context_before > 0 || params.context_after > 0;
+    let max_lines = params.max_lines;
     let max_line_bytes = params.max_line_bytes;
     let results: Arc<Mutex<Vec<GrepFileEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let base: Arc<Path> = Arc::from(base);
@@ -119,6 +122,9 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
                     has_context,
                 };
                 let _ = searcher.search_path(&*matcher, &path, &mut sink);
+                if let Some(max_lines) = max_lines {
+                    truncate_group_lines(&mut groups, max_lines);
+                }
 
                 if !groups.is_empty() {
                     let rel = path
@@ -148,14 +154,41 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
     });
 
     let mut total_groups = 0;
+    let mut total_lines = 0;
     for entry in &mut entries {
         let remaining = params.limit.saturating_sub(total_groups);
         entry.groups.truncate(remaining);
+        if let Some(max_lines) = params.max_lines {
+            let remaining = max_lines.saturating_sub(total_lines);
+            total_lines += truncate_group_lines(&mut entry.groups, remaining);
+        }
         total_groups += entry.groups.len();
     }
     entries.retain(|e| !e.groups.is_empty());
 
     Ok((base.to_path_buf(), entries))
+}
+
+fn truncate_group_lines(groups: &mut Vec<GrepMatchGroup>, max_lines: usize) -> usize {
+    let mut remaining = max_lines;
+    for group in groups.iter_mut() {
+        if remaining == 0 {
+            group.lines.clear();
+            continue;
+        }
+        if group.lines.len() > remaining {
+            if let Some(first_match) = group.lines.iter().position(|line| line.is_match) {
+                let start = first_match.saturating_sub(remaining - 1);
+                if start > 0 {
+                    group.lines = group.lines.split_off(start);
+                }
+            }
+            group.lines.truncate(remaining);
+        }
+        remaining -= group.lines.len();
+    }
+    groups.retain(|group| group.lines.iter().any(|line| line.is_match));
+    max_lines - remaining
 }
 
 struct GrepSink<'a> {

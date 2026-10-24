@@ -262,6 +262,7 @@ maki.api.register_tool({
       context_before = input.context_before or 0,
       context_after = input.context_after or 0,
       limit = limit,
+      max_lines = max_lines,
       max_line_bytes = max_line_bytes,
     })
 

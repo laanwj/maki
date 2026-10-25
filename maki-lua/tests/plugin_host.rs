@@ -2490,6 +2490,63 @@ fn warm_map_cleared_by_load_source() {
     assert_eq!(body.read()[0].spans[0].text, WARM_INITIAL_LINE);
 }
 
+#[test]
+fn memory_pressure_evicts_warm_views_and_recovers_allocations() {
+    const BLOB_BYTES: usize = 24 * 1024 * 1024;
+    const CALLS: usize = 24;
+    const PROBE_BYTES: usize = 16 * 1024 * 1024;
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"local ballast_calls = 0
+        maki.api.register_tool({{
+            name = "ballast",
+            description = "small output with a large captured view",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                ballast_calls = ballast_calls + 1
+                local blob = string.rep(string.char(64 + ballast_calls), {BLOB_BYTES})
+                local buf = maki.ui.buf()
+                buf:line("tiny")
+                buf:on("click", function()
+                    buf:line(tostring(#blob))
+                end)
+                ctx:live_buf(buf)
+                return "ok"
+            end
+        }})
+        maki.api.register_tool({{
+            name = "probe",
+            description = "small allocation probe",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function()
+                local probe_blob = string.rep("z", {PROBE_BYTES})
+                return tostring(#probe_blob) .. "/" .. tostring(collectgarbage("count"))
+            end
+        }})"#
+    );
+    host.load_source("ballast_plugin", &src).unwrap();
+
+    let mut first_buf = None;
+    for i in 0..CALLS {
+        let (ctx, rx) = warm_ctx(&format!("ballast-{i}"));
+        exec_warm_tool(&reg, "ballast", &ctx).expect("ballast call");
+        if i == 0 {
+            first_buf = recv_live_buf(&rx, "ballast-0");
+        }
+    }
+    let first_buf = first_buf.expect("first live buf");
+    let (ctx, _rx) = warm_ctx("probe-after");
+    let after = exec_warm_tool(&reg, "probe", &ctx);
+    assert!(after.is_ok(), "memory pressure must not wedge later calls");
+    assert!(
+        first_buf.click().is_none(),
+        "memory pressure did not evict the warm handler"
+    );
+}
+
 /// LoadSource's drain barrier spawns and awaits queued async jobs, so
 /// jobs a warm click enqueues land before the barrier returns.
 #[test]

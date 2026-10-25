@@ -864,6 +864,7 @@ type WarmTools = Rc<RefCell<VecDeque<WarmTool>>>;
 /// the budget is never warmed (its clicks take the restore fallback), so a
 /// monster result can never pin its task's whole buf store.
 pub const WARM_TOOL_BYTES: usize = 8 * 1024 * 1024;
+const MEMORY_RELIEF_BYTES: usize = LUA_MEMORY_LIMIT / 2;
 
 /// A finished tool that still answers clicks. `handle` is a fresh cell
 /// holding only the root buf; `_claim` keeps the buf handler slots alive
@@ -893,6 +894,23 @@ fn push_warm(warm: &WarmTools, tool: WarmTool) {
             break;
         }
     }
+}
+
+fn relieve_memory_pressure(lua: &Lua, warm: &WarmTools) {
+    let before = lua.used_memory();
+    if before < MEMORY_RELIEF_BYTES {
+        return;
+    }
+    warm.borrow_mut().clear();
+    if let Err(e) = lua.gc_collect() {
+        tracing::warn!(error = %e, "full Lua GC under memory pressure failed");
+        return;
+    }
+    tracing::debug!(
+        before_kib = before / 1024,
+        after_kib = lua.used_memory() / 1024,
+        "cleared warm views and completed full Lua GC under memory pressure"
+    );
 }
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
@@ -2918,6 +2936,7 @@ impl LuaRuntime {
                 }
             }
         }
+        relieve_memory_pressure(&self.lua, &self.warm_tools);
         revision_guard
     }
 
@@ -4320,6 +4339,7 @@ async fn run_tool_call(
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
+    relieve_memory_pressure(&lua, &warm_tools);
     let handler: Function = {
         let plugins_ref = plugins.borrow();
         let Some(owner) = plugins_ref.get(&*plugin) else {

@@ -5268,6 +5268,33 @@ maki.session.prompt("Implement the plan. Read it with plan_read.", { session = o
 
 ---
 
+### `maki.session.new_plan()` {#maki-session-new_plan}
+
+```lua
+maki.session.new_plan({opts?})
+```
+
+Allocates a fresh plan path for a live session and switches to plan mode
+without clearing its history or context.
+
+Requires the `session_settings` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
+
+**Returns:** (`string|nil`, `string|nil`) The absolute path of the new plan file,
+  or nil and an error.
+
+**Example:**
+
+```lua
+local path, err = maki.session.new_plan()
+```
+
+---
+
 ### `maki.session.set_title()` {#maki-session-set_title}
 
 ```lua

@@ -760,6 +760,28 @@ async fn set_mode(
     roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
 }
 
+/// Allocates a fresh plan path for a live session and switches to plan mode
+/// without clearing its history or context.
+///
+/// @param opts table? Options:
+///   session (string) id of a live session, defaults to the focused one.
+/// @return (string|nil, string|nil) The absolute path of the new plan file,
+///   or nil and an error.
+/// @example
+/// local path, err = maki.session.new_plan()
+#[lua_fn(guard = SessionSettings)]
+async fn new_plan(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let id = match opts {
+        Some(opts) => opts.opt("session")?,
+        None => None,
+    };
+    roundtrip(lua, tx, SessionRequest::NewPlan { id }).await
+}
+
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -796,7 +818,8 @@ lua_table! {
     DOCS [
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx), focus(tx),
         delete(perms, tx), new(perms, tx, may_run_agents), prompt(perms, tx),
-        notify(perms, may_run_agents), set_mode(perms, tx), set_title(perms, tx),
+        notify(perms, may_run_agents), set_mode(perms, tx), new_plan(perms, tx),
+        set_title(perms, tx),
     ]
 }
 
@@ -842,6 +865,7 @@ mod tests {
     const THINKING: &str = "high";
     const PLUGIN: &str = "test";
     const FACTS_CWD: &str = "/origin";
+    const PLAN_PATH: &str = "/tmp/maki/plans/fresh.md";
     const ONE_MESSAGE: &str = "{ { role = 'user', content = { { type = 'text', text = 'hi' } } } }";
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
@@ -935,6 +959,38 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert!(val);
+    }
+
+    /// The fresh plan belongs to the session that asked for it, so a row
+    /// handler for a background tab has to be able to name it, and the reply
+    /// carries the path back. A null `session` straight from
+    /// `maki.json.decode` counts as absent, so the focused tab is used.
+    #[test_case(r#"return session.new_plan({ session = 'abc' })"#, Some("abc") ; "explicit_session_id")]
+    #[test_case("return session.new_plan()", None ; "defaults_to_focused")]
+    #[test_case(r#"return session.new_plan(maki.json.decode('{"session": null}'))"#, None ; "decoded_null_session_defaults_to_focused")]
+    fn new_plan_forwards_the_session_id_and_returns_the_path(
+        code: &str,
+        expected_id: Option<&str>,
+    ) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = plugin_lua(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::NewPlan { id },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected new_plan request");
+            };
+            assert_eq!(id, expected_id);
+            reply_tx.send(Ok(json!(PLAN_PATH))).unwrap();
+        });
+        let (val, err): (String, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, PLAN_PATH);
     }
 
     #[test]

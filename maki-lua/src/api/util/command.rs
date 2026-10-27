@@ -472,6 +472,9 @@ pub enum SessionRequest {
         id: Option<String>,
         mode: String,
     },
+    NewPlan {
+        id: Option<String>,
+    },
     SetTitle {
         id: String,
         title: String,

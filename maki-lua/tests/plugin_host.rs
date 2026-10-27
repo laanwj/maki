@@ -5974,6 +5974,7 @@ fn run_call_with(held: &[Permission], call: &str) -> String {
 #[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::Agent], Permission::SessionWrite ; "prompt_with_only_agent")]
 #[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::SessionWrite], Permission::Agent ; "prompt_with_only_session_write")]
 #[test_case::test_case(r#"maki.session.set_mode("plan")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_mode_with_only_write")]
+#[test_case::test_case("maki.session.new_plan()", &[Permission::SessionWrite], Permission::SessionSettings ; "new_plan_with_only_write")]
 #[test_case::test_case(r#"maki.session.set_title({ id = "x", title = "t" })"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_title_with_only_write")]
 #[test_case::test_case(r#"maki.model.set("x")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "model_set_with_only_write")]
 #[test_case::test_case(r#"maki.session.notify("ci red", { session = "x", wake = true })"#, &[Permission::SessionWrite], Permission::Agent ; "waking_notify_with_only_write")]

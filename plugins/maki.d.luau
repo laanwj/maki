@@ -162,6 +162,7 @@ declare maki: {
     prompt: @checked (text: string, opts: any) -> (string?, string?),
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
+    new_plan: @checked (opts: any) -> (string?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
   },
   task: {

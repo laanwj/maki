@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{
@@ -22,7 +23,7 @@ const COMPACT_LABEL: &str = "/compact";
 
 type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 /// What a message must agree on with its neighbours to share their turn.
-type BatchKey = (AgentMode, bool);
+type BatchKey = (AgentMode, Option<PathBuf>, bool);
 
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
@@ -52,19 +53,18 @@ pub(crate) struct QueuedInput {
 impl QueuedInput {
     /// The set of messages this one may share a turn with, or `None` when it
     /// has to run alone: the agent resolves one MCP prompt per run. `mode` is
-    /// a permission boundary and `workflow` picks the tool catalog, so a
-    /// message queued under either may not execute under another one.
+    /// a permission boundary, `plan_path` selects the plan tools' target, and
+    /// `workflow` picks the tool catalog, so a message queued under any of
+    /// them may not execute under another one.
     ///
     /// Destructured on purpose: a new `AgentInput` field then has to be
     /// classified here instead of silently merging across.
     fn batch_key(&self) -> Option<BatchKey> {
-        // plan_path rides the mode: a fresh plan file only ever appears with
-        // a plan-mode switch, which the key already separates on.
         let AgentInput {
             mode,
             workflow,
             prompt,
-            plan_path: _,
+            plan_path,
             message: _,
             images: _,
             preamble: _,
@@ -73,7 +73,9 @@ impl QueuedInput {
             fast: _,
             source: _,
         } = &self.input;
-        prompt.is_none().then(|| (mode.clone(), *workflow))
+        prompt
+            .is_none()
+            .then(|| (mode.clone(), plan_path.clone(), *workflow))
     }
 }
 
@@ -286,9 +288,9 @@ impl InterruptSource for QueueReceiver {
 /// drives the run and the earlier ones ride in front of it as their own user
 /// messages, so each keeps its images and the model answers the burst in one
 /// request. They stay messages rather than preamble, so `agent.user_message`
-/// gets to judge every one. The run shares one mode and one workflow by
-/// construction, so only the preferences (thinking, fast) come from the last
-/// message, the user's most recent intent.
+/// gets to judge every one. The run shares one mode, plan association and
+/// workflow by construction, so only the preferences (thinking, fast) come
+/// from the last message, the user's most recent intent.
 pub(crate) fn merge_inputs(mut inputs: Vec<AgentInput>) -> Option<AgentInput> {
     let mut last = inputs.pop()?;
     last.earlier = inputs
@@ -318,6 +320,7 @@ mod tests {
     const THIRD: &str = "third";
     const PROMPT_NAME: &str = "server/review";
     const PLAN_PATH: &str = "plan.md";
+    const OTHER_PLAN_PATH: &str = "other-plan.md";
     const NOT_AN_INTERRUPT: &str = "expected an interrupt carrying the queued messages";
     const GUIDANCE: &str = "keep the failing test names";
 
@@ -350,9 +353,18 @@ mod tests {
         QueueItem::Message(queued(text, 0))
     }
 
-    fn plan_message(text: &str) -> QueueItem {
+    fn plan_message(text: &str, path: &str) -> QueueItem {
         let mut queued = queued(text, 0);
-        queued.input.mode = AgentMode::Plan(PLAN_PATH.into());
+        queued.input.mode = AgentMode::Plan(path.into());
+        queued.input.plan_path = Some(path.into());
+        QueueItem::Message(queued)
+    }
+
+    /// An implementing session's message: Build permissions apply, but the
+    /// plan tools still target `path`.
+    fn implementing_message(text: &str, path: &str) -> QueueItem {
+        let mut queued = queued(text, 0);
+        queued.input.plan_path = Some(path.into());
         QueueItem::Message(queued)
     }
 
@@ -441,9 +453,12 @@ mod tests {
     #[test_case(vec![message(FIRST), compact(None), message(SECOND)], vec![vec![FIRST], vec![COMPACT_LABEL], vec![SECOND]] ; "compact_splits_the_drain_and_keeps_its_place")]
     #[test_case(vec![message(FIRST), prompt_message(SECOND), message(THIRD)], vec![vec![FIRST], vec![SECOND], vec![THIRD]] ; "mcp_prompt_runs_alone")]
     #[test_case(vec![message(FIRST)], vec![vec![FIRST]] ; "single_message_unchanged")]
-    #[test_case(vec![plan_message(FIRST), plan_message(SECOND)], vec![vec![FIRST, SECOND]] ; "one_mode_rides_together")]
-    #[test_case(vec![plan_message(FIRST), message(SECOND)], vec![vec![FIRST], vec![SECOND]] ; "mode_change_splits_the_drain")]
+    #[test_case(vec![plan_message(FIRST, PLAN_PATH), plan_message(SECOND, PLAN_PATH)], vec![vec![FIRST, SECOND]] ; "one_mode_rides_together")]
+    #[test_case(vec![plan_message(FIRST, PLAN_PATH), message(SECOND)], vec![vec![FIRST], vec![SECOND]] ; "mode_change_splits_the_drain")]
     #[test_case(vec![message(FIRST), workflow_message(SECOND), message(THIRD)], vec![vec![FIRST], vec![SECOND], vec![THIRD]] ; "workflow_change_splits_the_drain")]
+    #[test_case(vec![implementing_message(FIRST, PLAN_PATH), implementing_message(SECOND, PLAN_PATH)], vec![vec![FIRST, SECOND]] ; "one_plan_target_rides_together")]
+    #[test_case(vec![implementing_message(FIRST, PLAN_PATH), implementing_message(SECOND, OTHER_PLAN_PATH)], vec![vec![FIRST], vec![SECOND]] ; "plan_path_change_splits_the_drain")]
+    #[test_case(vec![plan_message(FIRST, PLAN_PATH), plan_message(SECOND, OTHER_PLAN_PATH)], vec![vec![FIRST], vec![SECOND]] ; "plan_file_change_splits_the_drain")]
     fn pop_run_groups_the_queue_into_turns(items: Vec<QueueItem>, expected: Vec<Vec<&str>>) {
         let (tx, rx) = queue();
         for item in items {

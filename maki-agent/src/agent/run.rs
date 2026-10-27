@@ -2424,6 +2424,7 @@ mod tests {
     const NEXT_DATE: &str = "2026-10-03";
     const MEMORY_HINT: &str = "memory/after_instructions";
     const PLAN_FILE: &str = "/plans/p.md";
+    const NEXT_PLAN_FILE: &str = "/plans/next.md";
     /// The plan-mode update carries the plan text; the path itself stays
     /// user-facing only, so tests key on the text and the path's absence.
     const PLAN_ON: &str = "# Plan Mode";
@@ -2581,6 +2582,35 @@ mod tests {
             !updates[2].contains(PLAN_FILE),
             "plan path stays user-facing"
         );
+    }
+
+    /// `/newplan` swaps the plan file without leaving plan mode. The model
+    /// hears the mode is on again, but neither file: only the update's facts
+    /// carry the new path, for the UI and a resume.
+    #[test]
+    fn plan_file_switch_is_appended_without_either_path() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Plan(PLAN_FILE.into()));
+        let before_switch = h.history.len();
+        h.run_in(AgentMode::Plan(NEXT_PLAN_FILE.into()));
+
+        h.assert_append_only();
+        assert_eq!(
+            appended_updates(&h.history, before_switch),
+            vec![FactsUpdate {
+                plan: Some(PlanChange::Entered(NEXT_PLAN_FILE.into())),
+                ..FactsUpdate::default()
+            }]
+        );
+        let updates = updates(&h.history);
+        assert_eq!(updates.len(), 2);
+        for text in updates {
+            assert!(text.contains(PLAN_ON));
+            assert!(
+                !text.contains(PLAN_FILE) && !text.contains(NEXT_PLAN_FILE),
+                "plan paths stay user-facing"
+            );
+        }
     }
 
     /// Neither fits in an update. Other tools need another array, and a prompt

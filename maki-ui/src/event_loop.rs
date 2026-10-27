@@ -1468,6 +1468,17 @@ impl<'t> EventLoop<'t> {
                 });
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::NewPlan { id } => {
+                let reply = (|| {
+                    let idx = self.resolve_session_index(id.as_deref())?;
+                    let path = self.sessions[idx]
+                        .app
+                        .new_plan()
+                        .map_err(|e| format!("failed to allocate plan path: {e}"))?;
+                    Ok(json!(path.to_string_lossy().into_owned()))
+                })();
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
                 let reply = (|| {

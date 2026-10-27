@@ -80,13 +80,8 @@ impl SessionState {
         let mut warnings = Vec::new();
 
         let mut plan = match &session.meta.plan_path {
-            Some(p) if Path::new(p).exists() => {
-                if session.meta.plan_written {
-                    PlanState::Ready(PathBuf::from(p))
-                } else {
-                    PlanState::Drafting(PathBuf::from(p))
-                }
-            }
+            Some(p) if !session.meta.plan_written => PlanState::Drafting(PathBuf::from(p)),
+            Some(p) if Path::new(p).exists() => PlanState::Ready(PathBuf::from(p)),
             Some(_) => {
                 warnings.push(PLAN_FILE_MISSING_WARNING.into());
                 PlanState::None
@@ -428,8 +423,9 @@ mod tests {
     fn plan_mode_with_missing_file_allocates_new_path_and_warns() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let session =
+        let mut session =
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
+        session.meta.plan_written = true;
         let state = SessionState::from_session(
             OpenSession::claimed(session, &storage),
             &test_model(),
@@ -440,6 +436,30 @@ mod tests {
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
         assert_eq!(state.warnings.len(), 1);
         assert_eq!(state.warnings[0], PLAN_FILE_MISSING_WARNING);
+    }
+
+    /// An unwritten draft points at a file that does not exist yet, so a
+    /// missing path is not a loss to warn about: it restores as `Drafting`.
+    #[test]
+    fn plan_mode_with_missing_unwritten_draft_preserves_path_without_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let session =
+            make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &test_model(),
+            &storage,
+        );
+        assert_eq!(state.mode, Mode::Plan);
+        assert_eq!(
+            state.plan,
+            PlanState::Drafting(PathBuf::from("/nonexistent/plan.md"))
+        );
+        assert!(
+            state.warnings.is_empty(),
+            "no file was ever written, so nothing is missing"
+        );
     }
 
     #[test]
@@ -491,6 +511,54 @@ mod tests {
         );
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
+    }
+
+    /// The same unwritten draft in Build mode: the missing path survives
+    /// untouched, and Build mode never allocates one.
+    #[test]
+    fn build_mode_with_missing_unwritten_draft_preserves_path_without_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let session =
+            make_plan_session(Some(StoredMode::Build), Some("/nonexistent/plan.md".into()));
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &test_model(),
+            &storage,
+        );
+        assert_eq!(state.mode, Mode::Build);
+        assert_eq!(
+            state.plan,
+            PlanState::Drafting(PathBuf::from("/nonexistent/plan.md"))
+        );
+        assert!(
+            state.warnings.is_empty(),
+            "no file was ever written, so nothing is missing"
+        );
+    }
+
+    /// A written plan whose file disappeared warns and clears. Only Plan
+    /// mode allocates a replacement, so Build resumes without a path.
+    #[test]
+    fn build_mode_with_missing_written_plan_warns_and_clears_without_allocating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session =
+            make_plan_session(Some(StoredMode::Build), Some("/nonexistent/plan.md".into()));
+        session.meta.plan_written = true;
+        let state = SessionState::from_session(
+            OpenSession::claimed(session, &storage),
+            &test_model(),
+            &storage,
+        );
+        assert_eq!(state.mode, Mode::Build);
+        assert_eq!(
+            state.plan,
+            PlanState::None,
+            "Build mode must not allocate a replacement"
+        );
+        assert_eq!(state.warnings.len(), 1);
+        assert_eq!(state.warnings[0], PLAN_FILE_MISSING_WARNING);
     }
 
     /// The level `clamped` picks is its own business. All this layer promises

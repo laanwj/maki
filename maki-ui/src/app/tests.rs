@@ -97,6 +97,7 @@ const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
 /// abandoned pick was made against.
 const OTHER_PLAN_DRAFT_NAME: &str = "other-plan.md";
 const OTHER_PLAN_TEXT: &str = "the loaded session's own plan";
+const PREVIOUS_PLAN_TEXT: &str = "the previous plan";
 const PLUGIN_ROW_LABEL: &str = "Commit and implement";
 const PLUGIN_ROW_ID: &str = "commit_and_implement";
 const PLUGIN_ROW_OWNER: &str = "planner";
@@ -668,6 +669,140 @@ fn toggle_mode_state_machine() {
     tab(&mut app);
     assert_eq!(app.state.mode, Mode::Plan);
     assert_eq!(app.state.plan.path().unwrap(), first_path);
+}
+
+#[test]
+fn new_plan_replaces_plan_without_resetting_session() {
+    let (tmp, dir, writer, mut app) = tempdir_app();
+    let (shared_queue, _rx) = shared_queue::queue();
+    app.queue.set_shared(shared_queue);
+    app.state
+        .session_mut()
+        .push_message(Message::user("preserve this history".into()));
+    let session_id = app.state.session.id;
+    let old_path = tmp.path().join("old-plan.md");
+    fs::write(&old_path, PREVIOUS_PLAN_TEXT).unwrap();
+    app.state.mode = Mode::Build;
+    app.state.plan = PlanState::Ready(old_path.clone());
+    app.input_box.set_input(MAIN_DRAFT.into());
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let _ = app.handle_submit(Submission {
+        text: QUEUED_PROMPT.into(),
+        images: vec![],
+    });
+    assert_eq!(app.queue.len(), 1);
+    app.plan_form.on_plan_ready();
+
+    let new_path = app.new_plan().unwrap();
+
+    assert_ne!(new_path, old_path);
+    assert_eq!(app.state.session.id, session_id);
+    assert_eq!(app.state.session.messages().len(), 1);
+    assert_eq!(app.input_box.buffer.value(), MAIN_DRAFT);
+    assert_eq!(app.queue.len(), 1);
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.state.plan, PlanState::Drafting(new_path.clone()));
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(fs::read_to_string(&old_path).unwrap(), PREVIOUS_PLAN_TEXT);
+
+    let input = app.build_agent_input(&QueuedMessage {
+        text: "next prompt".into(),
+        images: vec![],
+    });
+    assert_eq!(input.mode, AgentMode::Plan(new_path.clone()));
+    assert_eq!(input.plan_path, Some(new_path.clone()));
+
+    drain_writer(app, writer);
+    let saved = AppSession::load(session_id, &dir).unwrap();
+    assert_eq!(saved.messages().len(), 1);
+    assert_eq!(saved.meta.mode, Some(StoredMode::Plan));
+    let new_path_string = new_path.to_string_lossy().into_owned();
+    assert_eq!(
+        saved.meta.plan_path.as_deref(),
+        Some(new_path_string.as_str())
+    );
+    assert!(!saved.meta.plan_written);
+
+    let resumed =
+        SessionState::from_session(OpenSession::claimed(saved, &dir), &test_model(), &dir);
+    assert_eq!(resumed.plan, PlanState::Drafting(new_path));
+    assert!(resumed.warnings.is_empty());
+}
+
+#[test]
+fn new_plan_retires_pending_plan_answers() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let (tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    let _form_tx = awaiting_plan_form(&mut app);
+
+    let new_path = app.new_plan().unwrap();
+    assert!(app.plan_answers.action.is_none());
+    assert!(app.plan_answers.form.is_none());
+
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+    tx.send(PlanActionOutcome::Proceed).unwrap();
+    let _ = app.tick();
+
+    assert!(app.pending_actions.is_empty());
+    assert_eq!(app.state.plan, PlanState::Drafting(new_path));
+}
+
+#[test]
+fn new_plan_allocation_failure_leaves_state_untouched() {
+    let (tmp, _dir, _writer, mut app) = tempdir_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    app.plan_form.on_plan_ready();
+    let (_tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+    let previous_plan = app.state.plan.clone();
+    let plans_path = tmp.path().join("plans");
+    if plans_path.is_dir() {
+        fs::remove_dir_all(&plans_path).unwrap();
+    }
+    fs::write(plans_path, "not a directory").unwrap();
+
+    let error = app.new_plan().unwrap_err();
+
+    assert!(!error.to_string().is_empty());
+    assert_eq!(app.state.plan, previous_plan);
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_answers.action.is_some());
+}
+
+#[test]
+fn only_writes_to_replacement_plan_mark_it_ready() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    let old_path = PathBuf::from(PLAN_DRAFT_PATH);
+    app.state.plan = PlanState::Ready(old_path.clone());
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let new_path = app.new_plan().unwrap();
+    let write_done = |id: &str, path: &Path| {
+        agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: id.into(),
+            tool: "plan_write".into(),
+            output: Arc::new(ToolOutput::Plain("wrote the plan".into())),
+            is_error: false,
+            annotation: None,
+            written_path: Some(path.to_string_lossy().into_owned()),
+        })))
+    };
+
+    let _ = app.update(write_done("old-write", &old_path));
+    assert_eq!(app.state.plan, PlanState::Drafting(new_path.clone()));
+
+    let _ = app.update(write_done("new-write", &new_path));
+    assert_eq!(app.state.plan, PlanState::Ready(new_path));
 }
 
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]

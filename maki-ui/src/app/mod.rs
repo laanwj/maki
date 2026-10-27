@@ -341,8 +341,8 @@ impl PlanAnswers {
     /// the pick a new one starts at. The counter only ever moves forward, so
     /// anything stamped with an earlier pick can only miss from here on.
     ///
-    /// Every reset path funnels through [`App::reset_ui_chrome`], which calls
-    /// this: a new one gets the invariant for free.
+    /// Session resets reach this through [`App::reset_ui_chrome`]. Plan
+    /// replacement calls it directly.
     fn abandon(&mut self) -> u64 {
         self.form = None;
         self.action = None;

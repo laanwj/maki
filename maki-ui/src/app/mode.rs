@@ -7,8 +7,8 @@ use crate::theme;
 use maki_agent::{AgentInput, AgentMode, InputSource};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::RequestOptions;
-use maki_storage::StateDir;
 use maki_storage::plans;
+use maki_storage::{StateDir, StorageError};
 use ratatui::style::{Color, Modifier, Style};
 
 use super::App;
@@ -115,6 +115,16 @@ impl App {
             Mode::Plan => self.enter_plan(),
             Mode::Build => self.state.mode = Mode::Build,
         }
+    }
+
+    pub(crate) fn new_plan(&mut self) -> Result<PathBuf, StorageError> {
+        let path = plans::new_plan_path(&self.storage)?;
+        self.state.plan = PlanState::Drafting(path.clone());
+        self.set_mode(Mode::Plan);
+        self.plan_form.reset();
+        self.plan_answers.abandon();
+        self.checkpoint_now();
+        Ok(path)
     }
 
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {

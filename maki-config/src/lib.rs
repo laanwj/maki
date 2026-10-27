@@ -109,6 +109,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "list",
     "memory",
     "mistral",
+    "newplan",
     "openrouter",
     "plan",
     "question",
@@ -156,6 +157,7 @@ pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
 pub const BRAIN_ROLE_BUILTINS: &[&str] = &[
     "batch",
     "memory",
+    "newplan",
     "plan",
     "question",
     "sessions",

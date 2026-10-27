@@ -188,7 +188,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only)."
+        "- **Plan / build**: Press `Tab` in the input to toggle plan mode (plan-file writes only). `/newplan` starts a fresh plan without clearing session history."
     )
     .unwrap();
     writeln!(

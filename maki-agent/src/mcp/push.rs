@@ -183,6 +183,7 @@ mod tests {
         let names = push.builtin_plugins.unwrap();
         assert!(names.iter().any(|n| n == "read"));
         assert!(!names.iter().any(|n| n == "task"));
+        assert!(!names.iter().any(|n| n == "newplan"));
         assert!(!names.iter().any(|n| n == "bash"));
     }
 

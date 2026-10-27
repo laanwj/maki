@@ -152,6 +152,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/plan"),
     },
     BundledPlugin {
+        name: "newplan",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/newplan"),
+    },
+    BundledPlugin {
         name: "task",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
@@ -1656,6 +1660,13 @@ mod tests {
     #[test]
     fn split_hosts_load_only_their_own_roles_builtins() {
         let all = PluginsConfig::from_plugins(HashMap::new());
+        let has_newplan = |host: &PluginHost| {
+            host.command_reader()
+                .load()
+                .commands
+                .iter()
+                .any(|command| command.name.as_ref() == "/newplan")
+        };
 
         let brain_reg = Arc::new(ToolRegistry::new());
         let mut brain = PluginHost::with_role(
@@ -1672,6 +1683,7 @@ mod tests {
             "the plan file is brain-side state"
         );
         assert!(!brain_reg.has("read"));
+        assert!(has_newplan(&brain), "the brain owns /newplan");
         assert!(
             brain_reg.tool_view("write").is_some(),
             "the brain loads the executor builtins' views"
@@ -1698,6 +1710,7 @@ mod tests {
         with_builtin_load(|| executor.load_builtins(&all)).unwrap();
         assert!(executor_reg.has("read"));
         assert!(!executor_reg.has("plan_write"));
+        assert!(!has_newplan(&executor));
         assert!(
             executor_reg.tool_view("write").is_none(),
             "the executor executes; it never paints"
@@ -1708,6 +1721,7 @@ mod tests {
         let mut single = PluginHost::new(Arc::clone(&single_reg)).unwrap();
         with_builtin_load(|| single.load_builtins(&all)).unwrap();
         assert!(single_reg.has("write"));
+        assert!(has_newplan(&single));
         assert!(single_reg.tool_view("write").is_none());
         assert!(!executor_reg.has("task"));
     }

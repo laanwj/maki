@@ -34,6 +34,7 @@ Type `/` in the input box to open the command palette.
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
 | `/memory` | View, edit, and delete memory files |
+| `/newplan` | Start a fresh plan without clearing session history |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 | `/tasks` | Browse and search tasks |
@@ -49,7 +50,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 - **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. A model whose API has no adaptive mode does not offer `adaptive`. A session set to it shows and sends the level the provider uses instead. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
-- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
+- **Plan / build**: Press `Tab` in the input to toggle plan mode (plan-file writes only). `/newplan` starts a fresh plan without clearing session history.
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.
 - **`/memory`**: open the memory file picker (view / edit / delete). See the `memory` tool under [Tools](/docs/tools/).
@@ -125,7 +126,7 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 - Needs `agent`, `session_write`: `/compact`, custom commands, MCP prompts.
 - Needs `session_write`: `/new`, `/fork`.
 - Needs `session_write`, `session_settings`: `/rename`, `/sessions`.
-- Needs `session_settings`: `/model`, `/cd`, `/fast`, `/workflow`, `/thinking`.
+- Needs `session_settings`: `/model`, `/cd`, `/fast`, `/workflow`, `/newplan`, `/thinking`.
 - Needs what its owner holds: every other plugin command, as described below.
 - Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These change permissions, folder trust, or installed packages.
 

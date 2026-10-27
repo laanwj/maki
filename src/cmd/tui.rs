@@ -438,6 +438,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let executor = split;
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             executor,
+            session_cwd: session_cwd.clone(),
             cli,
             resumed,
             claim,
@@ -463,6 +464,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let executor = split;
         crate::print::run(crate::print::PrintParams {
             executor,
+            session_cwd: session_cwd.clone(),
             model: stack.model,
             prompt: cli.initial_prompt,
             image_paths: cli.images,

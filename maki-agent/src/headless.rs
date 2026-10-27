@@ -60,6 +60,8 @@ pub struct HeadlessParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
+    /// Model-facing cwd when it differs from `initial_wd`, as in split mode.
+    pub cwd_override: Option<String>,
     pub resumed: Resumed,
     /// The right to write [`Self::resumed`]'s session, taken before its
     /// transcript was read.
@@ -162,8 +164,12 @@ fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String>
 
 pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
+    let cwd_override = params
+        .cwd_override
+        .clone()
+        .unwrap_or_else(|| working_dir.clone());
     let mode = AgentMode::Build;
-    let vars = template::env_vars();
+    let vars = template::env_vars(Some(&cwd_override));
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
     let prompt_slots = Arc::new(params.prompt_slots);
     let spec = ContextSpec::new(
@@ -228,6 +234,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                     params.plugin_rules,
                 )),
                 session_id: Some(run_session_ref),
+                cwd_override: Some(cwd_override.clone()),
                 background_for: None,
                 task_id: None,
                 mailbox: Some(mailbox),
@@ -273,6 +280,8 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
+    /// Model-facing cwd when it differs from `initial_wd`, as in split mode.
+    pub cwd_override: Option<String>,
     pub resumed: Resumed,
     /// See [`HeadlessParams::claim`].
     pub claim: SessionClaim,
@@ -304,7 +313,12 @@ pub struct InteractiveHandle {
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
-    let vars = template::env_vars();
+    let working_dir = params.initial_wd.to_string_lossy().into_owned();
+    let cwd_override = params
+        .cwd_override
+        .clone()
+        .unwrap_or_else(|| working_dir.clone());
+    let vars = template::env_vars(Some(&cwd_override));
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
     let spec = ContextSpec {
         system_override: params.system_prompt_override,
@@ -337,7 +351,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
 
-    let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
     permissions_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new(
@@ -410,6 +423,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::clone(&task_permissions),
                     session_id: Some(session_ref_clone.clone()),
+                    cwd_override: Some(cwd_override.clone()),
                     background_for: None,
                     task_id: None,
                     mailbox: Some(mailbox.clone()),

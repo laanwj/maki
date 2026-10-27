@@ -68,6 +68,7 @@ impl AgentLoop {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         resumed: Resumed,
+        cwd_override: Option<String>,
         shared_history: SharedMessages,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
@@ -84,6 +85,7 @@ impl AgentLoop {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
         let seed = mailbox.publish_seed(AgentSeed::new(
             resumed.id,
+            cwd_override,
             model_slot,
             config,
             tool_output_lines,
@@ -186,7 +188,7 @@ impl AgentLoop {
     /// would leave the session on screen with nothing to serve it.
     async fn initialize(&mut self) -> bool {
         let teardown = self.cancels.teardown().clone();
-        self.vars = template::env_vars();
+        self.vars = template::env_vars(self.seed.cwd_override.as_deref());
         self.reload_instructions().await;
         if teardown.is_cancelled() {
             return false;
@@ -208,7 +210,7 @@ impl AgentLoop {
     /// keeps, not a near copy that costs it the cache.
     async fn context_builder(&mut self) -> (RunContextBuilder, Arc<ResolvedPrompts>) {
         let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars();
+        self.vars = template::env_vars(self.seed.cwd_override.as_deref());
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
@@ -318,6 +320,7 @@ impl AgentLoop {
                 tool_output_lines: self.seed.tool_output_lines,
                 permissions: Arc::clone(&self.seed.permissions),
                 session_id: Some(self.seed.session_id.clone()),
+                cwd_override: self.seed.cwd_override.clone(),
                 background_for: None,
                 task_id: None,
                 mailbox: Some(self.mailbox.clone()),

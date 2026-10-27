@@ -109,6 +109,7 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    pub cwd_override: Option<String>,
     /// The chat session a plugin runs this agent for in the background, `None`
     /// for anything the user watches. Its file writes are denied while the
     /// chat plans, see [`crate::AgentSeed::background_write_block`]. Subagents
@@ -177,6 +178,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    cwd_override: Option<String>,
     background_for: Option<MakiId>,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
@@ -226,6 +228,7 @@ impl<'h> Agent<'h> {
             request_log_hash: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            cwd_override: params.cwd_override,
             background_for: params.background_for,
             task_id: params.task_id,
             mailbox: params.mailbox,
@@ -960,6 +963,7 @@ impl<'h> Agent<'h> {
             mode: self.mode.clone(),
             plan_path: self.plan_path.clone(),
             session_id: self.session_id.clone(),
+            cwd_override: self.cwd_override.clone(),
             background_for: self.background_for,
             task_id: self.task_id.clone(),
             tool_use_id: None,
@@ -1506,6 +1510,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
+                cwd_override: None,
                 background_for: None,
                 task_id: None,
                 mailbox: None,

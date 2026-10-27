@@ -57,6 +57,7 @@ impl AgentHandles {
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         resumed: Resumed,
+        cwd_override: Option<String>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -70,6 +71,7 @@ impl AgentHandles {
             flume::unbounded(),
             model_slot,
             resumed,
+            cwd_override,
             config,
             tool_output_lines,
             permissions,
@@ -167,6 +169,7 @@ impl AgentHandles {
                 frame: app.state.session.frame().cloned(),
                 session: None,
             },
+            app.split_mode.then(|| app.state.session.cwd.clone()),
             config,
             tool_output_lines,
             permissions,
@@ -228,6 +231,7 @@ fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     resumed: Resumed,
+    cwd_override: Option<String>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -254,6 +258,7 @@ fn spawn_agent_internal(
         config,
         tool_output_lines,
         resumed,
+        cwd_override,
         Arc::clone(&shared_history),
         mcp_handle.clone(),
         Arc::clone(permissions),
@@ -319,6 +324,7 @@ mod tests {
     const NO_TURN_END: &str = "the run never reported that it was over";
     const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
     const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
+    const EXECUTOR_CWD: &str = "/executor/workspace";
 
     struct StubProvider;
 
@@ -368,6 +374,14 @@ mod tests {
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
     ) -> (AgentHandles, Arc<PermissionManager>) {
+        spawn_on_with_cwd(model_slot, initial_history, None)
+    }
+
+    fn spawn_on_with_cwd(
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        initial_history: Vec<Message>,
+        cwd_override: Option<String>,
+    ) -> (AgentHandles, Arc<PermissionManager>) {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
@@ -380,6 +394,7 @@ mod tests {
                 history: initial_history,
                 ..Resumed::fresh()
             },
+            cwd_override,
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
@@ -409,11 +424,16 @@ mod tests {
         );
     }
 
-    /// Reports which model the agent handed it, then ends the turn with a
+    /// Reports the model and system prompt, then ends the turn with a
     /// non-retryable error so no stream has to be faked. `gate` parks a call in
     /// flight until the test lets it go, one permit per call.
+    struct RecordedCall {
+        model_id: String,
+        system: String,
+    }
+
     struct RecordingProvider {
-        calls: flume::Sender<String>,
+        calls: flume::Sender<RecordedCall>,
         gate: Option<flume::Receiver<()>>,
     }
 
@@ -422,15 +442,18 @@ mod tests {
             &'a self,
             model: &'a Model,
             _messages: &'a [Message],
-            _system: &'a str,
+            system: &'a str,
             _tools: &'a serde_json::Value,
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            let id = model.id.clone();
+            let call = RecordedCall {
+                model_id: model.id.clone(),
+                system: system.to_owned(),
+            };
             Box::pin(async move {
-                let _ = self.calls.send(id);
+                let _ = self.calls.send(call);
                 if let Some(ref gate) = self.gate {
                     gate.recv_async().await.expect(GATE_CLOSED);
                 }
@@ -446,14 +469,14 @@ mod tests {
         }
     }
 
-    fn recorder() -> (Arc<dyn Provider>, flume::Receiver<String>) {
+    fn recorder() -> (Arc<dyn Provider>, flume::Receiver<RecordedCall>) {
         let (calls, reported) = flume::unbounded();
         (Arc::new(RecordingProvider { calls, gate: None }), reported)
     }
 
     fn gated_recorder() -> (
         Arc<dyn Provider>,
-        flume::Receiver<String>,
+        flume::Receiver<RecordedCall>,
         flume::Sender<()>,
     ) {
         let (calls, reported) = flume::unbounded();
@@ -514,16 +537,40 @@ mod tests {
         }
     }
 
+    fn drive_turn_call(
+        handles: &AgentHandles,
+        reported: &flume::Receiver<RecordedCall>,
+        run_id: u64,
+        text: &str,
+    ) -> RecordedCall {
+        push_prompt(handles, run_id, text);
+        let call = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
+        await_turn_end(handles);
+        call
+    }
+
     fn drive_turn(
         handles: &AgentHandles,
-        reported: &flume::Receiver<String>,
+        reported: &flume::Receiver<RecordedCall>,
         run_id: u64,
         text: &str,
     ) -> String {
-        push_prompt(handles, run_id, text);
-        let model_id = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
-        await_turn_end(handles);
-        model_id
+        drive_turn_call(handles, reported, run_id, text).model_id
+    }
+
+    #[test]
+    fn executor_workspace_reaches_the_system_prompt() {
+        let (provider, reported) = recorder();
+        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
+        let (handles, _permissions) =
+            spawn_on_with_cwd(&cell, Vec::new(), Some(EXECUTOR_CWD.into()));
+
+        let system = drive_turn_call(&handles, &reported, 1, FIRST_PROMPT).system;
+
+        assert!(
+            system.contains(&format!("- Working directory: {EXECUTOR_CWD}\n")),
+            "{system}"
+        );
     }
 
     /// The regression the per-runtime cell fixed. With one process-wide slot,
@@ -582,14 +629,14 @@ mod tests {
         cell.store(slot(MODEL_B, &provider));
         release.send(()).expect(GATE_CLOSED);
         await_turn_end(&handles);
-        assert_eq!(in_flight, MODEL_A);
+        assert_eq!(in_flight.model_id, MODEL_A);
 
         push_prompt(&handles, 2, SECOND_PROMPT);
         let next = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
         release.send(()).expect(GATE_CLOSED);
         await_turn_end(&handles);
         assert_eq!(
-            next, MODEL_B,
+            next.model_id, MODEL_B,
             "a swap stored mid-flight must still land on the next turn"
         );
     }

@@ -53,6 +53,7 @@ pub struct SessionMailbox {
 /// to clone, so it builds one from this.
 pub struct AgentSeed {
     pub session_id: SessionRef,
+    pub cwd_override: Option<String>,
     pub model_slot: Arc<ArcSwap<ModelSlot>>,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
@@ -177,6 +178,7 @@ impl AgentSeed {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionRef,
+        cwd_override: Option<String>,
         model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
@@ -187,6 +189,7 @@ impl AgentSeed {
     ) -> Self {
         Self {
             session_id,
+            cwd_override,
             model_slot,
             config,
             tool_output_lines,
@@ -238,6 +241,7 @@ impl AgentSeed {
             provider: Arc::clone(&slot.provider),
             model: Arc::new(slot.model.clone()),
             session_id: Some(self.session_id.clone()),
+            cwd_override: self.cwd_override.clone(),
             background_for: Some(self.session_id.id()),
             mcp: self.mcp.clone(),
             config: self.config.clone(),

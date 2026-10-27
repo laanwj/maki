@@ -332,6 +332,8 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// Fixed executor workspace, or `None` to follow the process cwd.
+    pub cwd_override: Option<String>,
     /// See [`crate::AgentParams::background_for`]. Every nested call clones
     /// this context, so batch and code_execution children carry it too.
     pub background_for: Option<MakiId>,
@@ -584,6 +586,7 @@ pub fn interpreter_ctx(
         mode: mode.clone(),
         plan_path: mode.plan_path().map(Path::to_path_buf),
         session_id: None,
+        cwd_override: None,
         background_for: None,
         task_id: None,
         tool_use_id: None,
@@ -805,6 +808,7 @@ pub mod test_support {
         };
         AgentSeed::new(
             SessionRef::from(id),
+            None,
             Arc::new(ArcSwap::from_pointee(slot)),
             AgentConfig::default(),
             ToolOutputLines::default(),

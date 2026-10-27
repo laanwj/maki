@@ -723,7 +723,7 @@ pub fn prompt(
 
     let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
-    let vars = template::env_vars();
+    let vars = template::env_vars(None);
     let reg = ToolRegistry::global_arc();
 
     if tools {

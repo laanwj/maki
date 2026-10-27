@@ -427,6 +427,7 @@ impl SpawnCtx {
         let session = &open.session;
         let resumed = !session.messages().is_empty();
         let session_cwd = open.session.cwd.clone();
+        let cwd_override = self.split_mode.then(|| session_cwd.clone());
         let permissions = Arc::new(self.permissions.fork());
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
@@ -441,6 +442,7 @@ impl SpawnCtx {
                 // the frame it was sent under.
                 session: None,
             },
+            cwd_override,
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,

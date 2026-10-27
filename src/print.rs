@@ -159,6 +159,8 @@ pub struct PrintParams {
     /// Split-mode declaration: the executor's socket and the push to send
     /// it. Resolved by the caller from the same flags every entry point reads.
     pub executor: Option<(std::path::PathBuf, maki_agent::mcp::push::ExecutorPush)>,
+    /// The workspace the tools run in, which can differ from the brain's cwd.
+    pub session_cwd: String,
     /// Which session this run continues and writes under, and where. Resolved
     /// by the caller from the same flags every other entry point reads.
     pub resumed: Resumed,
@@ -184,6 +186,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         plugin_rules,
         project_config,
         executor,
+        session_cwd,
         resumed,
         claim,
         storage,
@@ -224,6 +227,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,
+        cwd_override: Some(session_cwd),
         resumed,
         claim,
         storage,

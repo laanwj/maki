@@ -393,7 +393,9 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
+    let agent = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
+    let slots = Arc::clone(&agent.prompt_slots);
+    let cwd_override = agent.cwd_override.clone();
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
@@ -405,7 +407,7 @@ async fn system_prompt(
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
-    let vars = maki_agent::template::env_vars();
+    let vars = maki_agent::template::env_vars(cwd_override.as_deref());
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
@@ -493,7 +495,7 @@ async fn tools(
         .excluding(&disabled)
         .excluding(maki_agent::tools::capability_exclusions(model));
 
-    let vars = maki_agent::template::env_vars();
+    let vars = maki_agent::template::env_vars(agent.cwd_override.as_deref());
     let ctx_desc = DescriptionContext {
         filter: &filter,
         audience,
@@ -980,6 +982,7 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            cwd_override: agent_ctx.cwd_override.clone(),
             background_for: agent_ctx.background_for,
             task_id: Some(Arc::from(cancellation.ui_id.as_str())),
             mailbox: None,
@@ -1939,6 +1942,7 @@ mod tests {
     const CHILD_SYSTEM: &str = "You analyse evidence.\n{{instructions}}";
     const CHILD_INSTRUCTIONS: &str = "Keep {{identity}} literal.";
     const CHILD_RESPONSE: &str = "Analysis complete.";
+    const EXECUTOR_CWD: &str = "/executor/workspace";
 
     struct PromptRecorder(Sender<String>);
 
@@ -2018,6 +2022,32 @@ mod tests {
             requests.recv().unwrap(),
             format!("You analyse evidence.\n{CHILD_INSTRUCTIONS}")
         );
+    }
+
+    #[test]
+    fn subagent_system_prompt_uses_the_parent_executor_workspace() {
+        let lua = Lua::new();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.cwd_override = Some(EXECUTOR_CWD.into());
+        let mut prompts = ResolvedPrompts::default();
+        prompts.set_template(PromptId::Research, "{environment}".into());
+        ctx.prompt_slots = Arc::new(prompts);
+
+        smol::block_on(async {
+            let ctx = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+            let opts = lua.create_table().unwrap();
+            opts.set("prompt_id", "research").unwrap();
+            let (system, error) = system_prompt(lua.clone(), ctx.borrow().unwrap(), opts)
+                .await
+                .unwrap();
+
+            assert!(error.is_none(), "{error:?}");
+            let system = system.unwrap();
+            assert!(
+                system.contains(&format!("- Working directory: {EXECUTOR_CWD}\n")),
+                "{system}"
+            );
+        });
     }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {

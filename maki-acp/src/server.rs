@@ -424,6 +424,7 @@ fn start_session(
         excluded_tools,
         mcp_handle: mcp.clone(),
         initial_wd: cwd.clone(),
+        cwd_override: None,
         resumed,
         claim: claim.clone(),
         storage: params.storage.clone(),

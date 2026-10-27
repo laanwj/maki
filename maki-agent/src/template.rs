@@ -9,11 +9,14 @@ const ENVIRONMENT: &str =
     "Environment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}";
 
 /// `{environment}` goes first, so the placeholders it brings in are filled by
-/// the vars after it.
-pub fn env_vars() -> Vars {
-    let cwd = env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| ".".into());
+/// the vars after it. `cwd_override` pins an executor workspace; `None`
+/// follows the process cwd, including changes between runs.
+pub fn env_vars(cwd_override: Option<&str>) -> Vars {
+    let cwd = cwd_override.map(str::to_owned).unwrap_or_else(|| {
+        env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into())
+    });
     let date = Zoned::now().strftime("%Y-%m-%d").to_string();
     Vars::new()
         .set("{environment}", ENVIRONMENT)
@@ -79,14 +82,14 @@ mod tests {
 
     #[test]
     fn env_vars_includes_date() {
-        let vars = env_vars();
+        let vars = env_vars(None);
         let result = vars.apply("{date}");
         assert_ne!(result.as_ref(), "{date}");
     }
 
     #[test]
     fn environment_is_filled_in_whole() {
-        let environment = env_vars().apply("{environment}").into_owned();
+        let environment = env_vars(None).apply("{environment}").into_owned();
         assert!(environment.starts_with("Environment:"), "{environment}");
         assert!(!environment.contains('{'), "{environment}");
     }

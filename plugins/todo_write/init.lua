@@ -28,6 +28,21 @@ local function items_of(sid, task)
   return todos[sid] and todos[sid][task] or {}
 end
 
+-- Recorded input replays as sent, including calls that failed schema
+-- validation, so `todos` is not guaranteed to be a list of well-formed items.
+local function todo_items(todos)
+  if type(todos) ~= "table" then
+    return {}
+  end
+  local items = {}
+  for _, item in ipairs(todos) do
+    if type(item) == "table" and type(item.content) == "string" then
+      items[#items + 1] = item
+    end
+  end
+  return items
+end
+
 local function count_done(items)
   local n = 0
   for _, item in ipairs(items) do
@@ -136,7 +151,7 @@ maki.api.register_tool({
   audiences = { "main", "research_sub", "general_sub" },
 
   header = function(input)
-    return string.format("%d todos", #(input.todos or {}))
+    return string.format("%d todos", #todo_items(input.todos))
   end,
 
   -- The panel is live-only, filled by handler calls during a turn. Replaying
@@ -144,7 +159,7 @@ maki.api.register_tool({
   -- every time a session is reopened, so this only draws the call's list into
   -- the chat. A failed call renders the same, since the input is intact.
   restore = function(input)
-    local items = input.todos or {}
+    local items = todo_items(input.todos)
     if #items == 0 then
       return nil
     end
@@ -154,7 +169,7 @@ maki.api.register_tool({
   end,
 
   handler = function(input, ctx)
-    local items = input.todos or {}
+    local items = todo_items(input.todos)
     local sid, task = ctx:session_id() or "", ctx:task_id()
     todos[sid] = todos[sid] or {}
     todos[sid][task] = items

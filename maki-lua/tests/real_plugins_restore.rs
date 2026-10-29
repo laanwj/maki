@@ -417,6 +417,40 @@ fn todo_write_restore_renders_the_list() {
     assert!(r.body.contains(TODO_ITEM), "list missing: {}", r.body);
 }
 
+/// A failed call's input replays as sent, so `todos` can be anything the
+/// model sent. An entry that is not a well-formed item must not take the
+/// whole restore down with it: the rest of the list still renders.
+#[test]
+fn todo_write_restore_survives_malformed_todos() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+
+    let whole = json!({ "todos": "not a list" });
+    let r = run_restore(
+        &host,
+        in_subagent_load(restore_item(TODO_TOOL, whole, "", None, Vec::new())),
+    );
+    assert_eq!(
+        r.body, "",
+        "a todos field that is not a list renders no body"
+    );
+
+    let mixed = json!({ "todos": [
+        { "content": TODO_ITEM, "status": "in_progress" },
+        "junk",
+        { "status": "pending" },
+    ]});
+    let r = run_restore(
+        &host,
+        in_subagent_load(restore_item(TODO_TOOL, mixed, "", None, Vec::new())),
+    );
+    assert!(
+        r.body.contains(TODO_ITEM),
+        "well-formed items must survive malformed ones: {}",
+        r.body
+    );
+}
+
 /// A session load replays a transcript, so its restores run with the panel
 /// closed. Refilling per-session state here would pop the panel open on the
 /// next focus change, resurrecting a list the turn already finished.

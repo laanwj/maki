@@ -120,6 +120,7 @@ function ToolView.new(buf, opts)
   self.all_skipped = 0
   self.expanded = false
   self.ring_map = {}
+  self.suspend = 0
   return self
 end
 
@@ -139,6 +140,25 @@ function ToolView:clear()
   self:flush()
 end
 
+local function flush_if_due(self)
+  if self.suspend == 0 then
+    self:flush()
+  end
+end
+
+-- Bulk appends share one flush: a flush per line is O(n * ring) work with a
+-- host call each, holding the Lua thread for the whole batch.
+local function append_all(self, lines)
+  self.suspend = self.suspend + 1
+  for _, line in ipairs(lines) do
+    self:append(line)
+  end
+  self.suspend = self.suspend - 1
+  if self.suspend == 0 then
+    self:flush()
+  end
+end
+
 function ToolView:append(line)
   local all_idx
   if #self.all_lines < self.max_expand_lines then
@@ -155,7 +175,7 @@ function ToolView:append(line)
       if all_idx then
         self.ring_map[self.ring_count] = all_idx
       end
-      self:flush()
+      flush_if_due(self)
     else
       self.skipped = self.skipped + 1
     end
@@ -174,14 +194,12 @@ function ToolView:append(line)
       self.ring_start = (self.ring_start % self.max) + 1
       self.skipped = self.skipped + 1
     end
-    self:flush()
+    flush_if_due(self)
   end
 end
 
 function ToolView:append_text(text)
-  for _, line in ipairs(maki.split(text, "\n")) do
-    self:append(line)
-  end
+  append_all(self, maki.split(text, "\n"))
 end
 
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
@@ -197,9 +215,11 @@ function ToolView:set_highlight(content: string, ext)
   local lines = maki.split(content, "\n")
 
   local fmt = ToolView.line_nr_fmt(#lines) .. " "
+  local numbered = {}
   for idx, line in ipairs(lines) do
-    self:append({ format_line_nr(fmt, idx), { line } })
+    numbered[idx] = { format_line_nr(fmt, idx), { line } }
   end
+  append_all(self, numbered)
 
   maki.async.run(function()
     local highlighted = maki.ui.highlight(content, ext)
@@ -297,9 +317,7 @@ end
 function ToolView.restore_lines(lines, opts)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, opts)
-  for _, line in ipairs(lines) do
-    view:append(line)
-  end
+  append_all(view, lines)
   view:finish()
   buf:on("click", function()
     view:toggle()

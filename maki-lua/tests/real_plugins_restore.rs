@@ -451,6 +451,59 @@ fn todo_write_restore_survives_malformed_todos() {
     );
 }
 
+/// Bulk appends through ToolView cost one flush, not one per line. A flush
+/// rebuilds the whole view and calls the host, so a per-line flush made a
+/// large output hold the Lua thread for the whole batch — the watchdog
+/// warned, and restores of big outputs ran into their deadline.
+#[test]
+fn tool_view_bulk_appends_flush_once() {
+    const SRC: &str = r#"
+local ToolView = require("maki.tool_view")
+
+local flushes = 0
+local orig_flush = ToolView.flush
+ToolView.flush = function(self)
+  flushes = flushes + 1
+  return orig_flush(self)
+end
+
+maki.api.register_tool({
+  name = "bulkview",
+  description = "reports how many flushes a bulk render cost",
+  schema = { type = "object", properties = { n = { type = "number" } } },
+  audiences = { "main" },
+  handler = function() return "unused" end,
+  restore = function(input)
+    local parts = {}
+    for i = 1, (input.n or 40) do
+      parts[i] = "line_" .. i
+    end
+    local buf = maki.ui.buf()
+    local view = ToolView.new(buf, { max_lines = 1000, keep = "tail" })
+    view:append_text(table.concat(parts, "\n"))
+    view:finish()
+    view:append("flushes=" .. flushes)
+    return buf
+  end,
+})
+"#;
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("bulkview", SRC).unwrap();
+
+    let r = restore(&host, "bulkview", json!({ "n": 40 }), "", None, Vec::new());
+
+    assert!(
+        r.body.contains("line_40"),
+        "content lost in the batch: {}",
+        r.body
+    );
+    assert!(
+        r.body.contains("flushes=1"),
+        "bulk appends must flush once, body: {}",
+        r.body
+    );
+}
+
 /// A session load replays a transcript, so its restores run with the panel
 /// closed. Refilling per-session state here would pop the panel open on the
 /// next focus change, resurrecting a list the turn already finished.

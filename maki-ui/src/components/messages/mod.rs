@@ -95,6 +95,9 @@ pub struct MessagesPanel {
     /// carries a restore fallback, so we never track the runtime's
     /// warm cache.
     watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
+    /// Tool ids whose missing snapshot was already reported, so a feed that
+    /// outlives its tool message cannot flood the log.
+    dropped_snapshot_warned: HashSet<(String, bool)>,
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
@@ -153,6 +156,7 @@ impl MessagesPanel {
             lua_clicks: HashMap::new(),
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
+            dropped_snapshot_warned: HashSet::new(),
             tool_output_lines: ui_config.tool_output_lines,
             lua_event_handle,
             restore_event_tx: None,
@@ -227,6 +231,7 @@ impl MessagesPanel {
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
+        self.dropped_snapshot_warned.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
         self.live_thinking_expanded = false;
@@ -1220,7 +1225,7 @@ impl MessagesPanel {
         snapshot: BufferSnapshot,
         is_header: bool,
         theme_gen: Option<u64>,
-    ) {
+    ) -> bool {
         if theme_gen.is_some() {
             // A generation only comes with restore replies. The restore
             // superseded the old live view (and evicted the runtime's
@@ -1228,7 +1233,7 @@ impl MessagesPanel {
             self.stop_watching(tool_id);
         }
         let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
-            return;
+            return false;
         };
         if let Some(msg) = self.find_tool_msg_mut(tool_id) {
             if is_header {
@@ -1239,11 +1244,18 @@ impl MessagesPanel {
             }
             msg.snapshot_theme_gen = applied_gen;
             self.rebuild_tool_segment(tool_id);
+            true
         } else {
-            warn!(
-                tool_id,
-                is_header, "snapshot dropped: no tool message with this id"
-            );
+            if self
+                .dropped_snapshot_warned
+                .insert((tool_id.to_owned(), is_header))
+            {
+                warn!(
+                    tool_id,
+                    is_header, "snapshot dropped: no tool message with this id"
+                );
+            }
+            false
         }
     }
 
@@ -1277,7 +1289,13 @@ impl MessagesPanel {
             .collect();
         let dirty = Dirty::from(!updated.is_empty());
         for (tool_id, lines) in updated {
-            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
+            if self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None) {
+                continue;
+            }
+            // The tool message is gone, so nothing can apply this buf's
+            // output again; polling it forever only spins the warn.
+            self.live_bufs.remove(&tool_id);
+            self.stop_watching(&tool_id);
         }
         dirty
     }

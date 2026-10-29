@@ -1947,6 +1947,27 @@ fn live_buf_streams_across_clean_polls() {
     assert_eq!(snapshot.lines.len(), 2);
 }
 
+/// A polled buf whose tool message is gone can never apply its output
+/// again. The poll must evict it instead of reading and warning forever:
+/// a feed that outlives its row once produced half a million warns.
+#[test]
+fn a_polled_buf_whose_tool_message_is_gone_is_evicted() {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.register_live_buf("gone".into(), Arc::clone(&buf));
+
+    buf.append(snap_line("first"));
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
+
+    buf.append(snap_line("second"));
+    assert_eq!(
+        panel.poll_live_bufs(),
+        Dirty::NO,
+        "the buf must be evicted once its snapshot found no tool message"
+    );
+    assert!(panel.live_bufs.is_empty(), "the registration must be gone");
+}
+
 #[test]
 fn tool_done_without_live_buf_preserves_existing_snapshot() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());

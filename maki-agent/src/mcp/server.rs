@@ -106,11 +106,98 @@ impl ProgressSink {
     }
 }
 
+/// Where the log dispatcher writes: the connection that last sent an
+/// initialize handshake. A probe never initializes, so it never takes the
+/// stream; a newer connection replaces an older one.
+#[derive(Clone)]
+struct LogTarget {
+    writer: Arc<std::sync::Mutex<Option<ConnWriter>>>,
+    changed: flume::Sender<()>,
+}
+
+impl LogTarget {
+    fn new() -> (Self, flume::Receiver<()>) {
+        let (changed, wake) = flume::unbounded();
+        (
+            Self {
+                writer: Arc::new(std::sync::Mutex::new(None)),
+                changed,
+            },
+            wake,
+        )
+    }
+
+    fn set(&self, writer: ConnWriter) {
+        *self.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+        let _ = self.changed.send(());
+    }
+
+    fn current(&self) -> Option<ConnWriter> {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Retires {writer} only while it is still the registered one, so a
+    /// connection that ends late cannot unset its replacement.
+    fn retire(&self, writer: &ConnWriter) {
+        let mut current = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|w| Arc::ptr_eq(&w.inner, &writer.inner))
+        {
+            *current = None;
+            drop(current);
+            let _ = self.changed.send(());
+        }
+    }
+}
+
+/// The one consumer of the log channel. A line in hand is released only
+/// after a successful write, so a probe that never initializes and a
+/// connection that died cannot eat records meant for the next brain; until
+/// one connects, the bounded channel itself is the buffer.
+async fn dispatch_logs(
+    logs: flume::Receiver<String>,
+    target: LogTarget,
+    changed: flume::Receiver<()>,
+) {
+    let mut held: Option<String> = None;
+    loop {
+        let line = match held.take() {
+            Some(line) => line,
+            None => match logs.recv_async().await {
+                Ok(line) => line,
+                Err(_) => return,
+            },
+        };
+        let writer = loop {
+            match target.current() {
+                Some(writer) => break writer,
+                None => {
+                    let _ = changed.recv_async().await;
+                }
+            }
+        };
+        let note = JsonRpcNotification::new("maki/log", Some(json!({ "line": line })));
+        if writer.write_json(&note).await.is_ok() {
+            continue;
+        }
+        // The brain went away mid-write; hold the line for its replacement.
+        target.retire(&writer);
+        held = Some(line);
+    }
+}
+
 pub async fn serve_unix<H: ServerHandler>(
     listener: UnixListener,
     handler: Arc<H>,
     notify: flume::Receiver<String>,
+    logs: flume::Receiver<String>,
 ) -> Result<(), McpError> {
+    let (target, changed) = LogTarget::new();
+    smol::spawn(dispatch_logs(logs, target.clone(), changed)).detach();
     loop {
         let (stream, _) = listener.accept().await.map_err(|e| McpError::StartFailed {
             server: "listener".into(),
@@ -118,8 +205,9 @@ pub async fn serve_unix<H: ServerHandler>(
         })?;
         let handler = Arc::clone(&handler);
         let notify = notify.clone();
+        let target = target.clone();
         smol::spawn(async move {
-            if let Err(e) = run_conn(stream, handler, notify).await {
+            if let Err(e) = run_conn(stream, handler, notify, target).await {
                 debug!(error = %e, "MCP connection closed");
             }
         })
@@ -131,6 +219,7 @@ async fn run_conn<H: ServerHandler>(
     stream: UnixStream,
     handler: Arc<H>,
     notify: flume::Receiver<String>,
+    target: LogTarget,
 ) -> Result<(), McpError> {
     let writer = ConnWriter {
         inner: Arc::new(Mutex::new(stream.clone())),
@@ -150,6 +239,8 @@ async fn run_conn<H: ServerHandler>(
         })
         .detach();
     }
+    // The log rail drains nothing on connect: the dispatcher holds every
+    // line until a connection that completed an initialize writes it.
     let in_flight: Arc<Mutex<HashMap<u64, CancelTrigger>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -177,6 +268,11 @@ async fn run_conn<H: ServerHandler>(
         };
         match (msg.id, msg.method) {
             (Some(id), Some(method)) => {
+                // The connection that speaks MCP properly takes the log
+                // stream; the startup workspace probe never initializes.
+                if method == "initialize" {
+                    target.set(writer.clone());
+                }
                 let (trigger, token) = CancelToken::new();
                 in_flight.lock().await.insert(id, trigger);
                 let writer = writer.clone();
@@ -405,17 +501,18 @@ mod tests {
         dir: &tempfile::TempDir,
         handler: H,
     ) -> std::path::PathBuf {
-        spawn_server_notify(dir, handler, flume::unbounded().1)
+        spawn_server_notify(dir, handler, flume::unbounded().1, flume::unbounded().1)
     }
 
     fn spawn_server_notify<H: ServerHandler>(
         dir: &tempfile::TempDir,
         handler: H,
         notify: flume::Receiver<String>,
+        logs: flume::Receiver<String>,
     ) -> std::path::PathBuf {
         let path = dir.path().join("srv.sock");
         let listener = UnixListener::bind(&path).expect("bind");
-        smol::spawn(serve_unix(listener, Arc::new(handler), notify)).detach();
+        smol::spawn(serve_unix(listener, Arc::new(handler), notify, logs)).detach();
         path
     }
 
@@ -648,7 +745,8 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let (notify_tx, notify_rx) = flume::unbounded();
-            let path = spawn_server_notify(&dir, FakeHandler, notify_rx);
+            let (log_tx, log_rx) = flume::unbounded();
+            let path = spawn_server_notify(&dir, FakeHandler, notify_rx, log_rx);
             let client = SocketTransport::connect("test", &path, Some(Duration::from_secs(5)))
                 .await
                 .unwrap();
@@ -656,6 +754,7 @@ mod tests {
 
             let hub = client.notification_hub().unwrap();
             let messages = hub.watch_messages();
+            let logs = hub.watch_logs();
             let (events_tx, events_rx) = flume::unbounded();
 
             let out = transport::call_tool_streaming(
@@ -686,6 +785,15 @@ mod tests {
 
             notify_tx.send("note from a plugin".to_string()).unwrap();
             assert_eq!(messages.recv_async().await.unwrap(), "note from a plugin");
+
+            log_tx
+                .send(r#"{"level":"WARN","fields":{"message":"executor note"}}"#.to_string())
+                .unwrap();
+            assert!(logs.recv_async().await.unwrap().contains("executor note"));
+            assert!(
+                messages.try_recv().is_err(),
+                "log lines must not reach flashes"
+            );
         });
     }
 
@@ -742,7 +850,7 @@ mod tests {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let (tx, rx) = flume::unbounded();
-            let path = spawn_server_notify(&dir, FakeHandler, rx);
+            let path = spawn_server_notify(&dir, FakeHandler, rx, flume::unbounded().1);
             let mut stream = UnixStream::connect(&path).await.unwrap();
 
             let init = json!({
@@ -767,6 +875,182 @@ mod tests {
             let note: Value = serde_json::from_str(line.trim()).unwrap();
             assert_eq!(note["method"], "notifications/message");
             assert_eq!(note["params"]["data"], "hello from a plugin");
+        });
+    }
+
+    #[test]
+    fn queued_log_lines_replay_and_stale_flashes_do_not() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (flash_tx, flash_rx) = flume::unbounded::<String>();
+            let (log_tx, log_rx) = flume::unbounded::<String>();
+            // Queued before anybody connects: the log rail replays them, the
+            // flash rail drains them as stale.
+            log_tx
+                .send(r#"{"level":"INFO","fields":{"message":"boot"}}"#.to_string())
+                .unwrap();
+            flash_tx.send("stale flash".to_string()).unwrap();
+            let path = spawn_server_notify(&dir, FakeHandler, flash_rx, log_rx);
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+
+            let init = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25", "capabilities": {} },
+            });
+            let mut buf = serde_json::to_vec(&init).unwrap();
+            buf.push(b'\n');
+            stream.write_all(&buf).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let mut lines = Vec::new();
+            // The replayed log line and the initialize response can arrive in
+            // either order.
+            for _ in 0..2 {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                lines.push(line.trim().to_owned());
+            }
+            let replayed = lines
+                .iter()
+                .find(|l| l.contains("\"maki/log\""))
+                .expect("the queued log line never replayed");
+            let note: Value = serde_json::from_str(replayed).unwrap();
+            assert_eq!(note["method"], "maki/log");
+            assert!(
+                note["params"]["line"]
+                    .as_str()
+                    .expect("line param is the record text")
+                    .contains("boot")
+            );
+            // The flash rail drained its queue as stale before its pump even
+            // started, so the stale flash can never be forwarded.
+            assert!(
+                !lines.iter().any(|l| l.contains("stale flash")),
+                "the stale flash must be drained, not forwarded"
+            );
+        });
+    }
+
+    /// The production sequence: the brain's startup probe connects and drops
+    /// without an initialize, then the real connection speaks MCP. The boot
+    /// record queued before anybody connected must reach the real one.
+    #[test]
+    fn a_probe_never_takes_the_log_stream() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log_tx, log_rx) = flume::unbounded::<String>();
+            let path = spawn_server_notify(&dir, FakeHandler, flume::unbounded().1, log_rx);
+            log_tx
+                .send(r#"{"level":"INFO","fields":{"message":"executor listening"}}"#.to_string())
+                .unwrap();
+
+            let probe = UnixStream::connect(&path).await.unwrap();
+            drop(probe);
+
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+            let init = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25", "capabilities": {} },
+            });
+            let mut buf = serde_json::to_vec(&init).unwrap();
+            buf.push(b'\n');
+            stream.write_all(&buf).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                line.clear();
+                let got = futures_lite::future::race(
+                    async { reader.read_line(&mut line).await.ok().unwrap_or_default() },
+                    async {
+                        smol::Timer::after(Duration::from_secs(2)).await;
+                        0
+                    },
+                )
+                .await;
+                if got == 0 {
+                    break;
+                }
+                seen.push(line.trim().to_owned());
+                if line.contains("\"maki/log\"") {
+                    break;
+                }
+            }
+            let replayed = seen
+                .iter()
+                .find(|l| l.contains("\"maki/log\""))
+                .expect("the boot record never reached the real connection");
+            assert!(replayed.contains("executor listening"));
+        });
+    }
+
+    /// A brain that dies without warning leaves its writer registered until
+    /// a write fails; the line in hand waits for the next brain instead of
+    /// dying with it.
+    #[test]
+    fn a_dead_writer_hands_its_line_to_the_next_brain() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log_tx, log_rx) = flume::unbounded::<String>();
+            let path = spawn_server_notify(&dir, FakeHandler, flume::unbounded().1, log_rx);
+
+            let mut first = UnixStream::connect(&path).await.unwrap();
+            let init = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25", "capabilities": {} },
+            });
+            let mut buf = serde_json::to_vec(&init).unwrap();
+            buf.push(b'\n');
+            first.write_all(&buf).await.unwrap();
+            first.flush().await.unwrap();
+            drop(first);
+
+            log_tx
+                .send(r#"{"level":"WARN","fields":{"message":"handoff"}}"#.to_string())
+                .unwrap();
+
+            let mut second = UnixStream::connect(&path).await.unwrap();
+            let mut buf = serde_json::to_vec(&init).unwrap();
+            buf.push(b'\n');
+            second.write_all(&buf).await.unwrap();
+            second.flush().await.unwrap();
+
+            let mut reader = BufReader::new(second);
+            let mut line = String::new();
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                line.clear();
+                let got = futures_lite::future::race(
+                    async { reader.read_line(&mut line).await.ok().unwrap_or_default() },
+                    async {
+                        smol::Timer::after(Duration::from_secs(2)).await;
+                        0
+                    },
+                )
+                .await;
+                if got == 0 {
+                    break;
+                }
+                seen.push(line.trim().to_owned());
+                if line.contains("\"maki/log\"") {
+                    break;
+                }
+            }
+            let handed = seen
+                .iter()
+                .find(|l| l.contains("\"maki/log\""))
+                .expect("the held line never reached the next brain");
+            assert!(handed.contains("handoff"));
         });
     }
 

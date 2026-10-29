@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use color_eyre::Result;
@@ -12,7 +13,7 @@ use maki_providers::provider::provider_for_slug;
 use maki_providers::spec::ProviderRegistry;
 use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
-use maki_storage::log::RotatingFileWriter;
+use maki_storage::log::{LogSink, RotatingFileWriter};
 use maki_storage::model::{read_model, read_thinking};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -234,7 +235,7 @@ pub fn report_session_start(start_type: &'static str, session_id: Option<impl Di
 /// the poison, so a single panic raised while a line was being written turned
 /// every later log call into a panic of its own. Taking the guard back out of
 /// the poison keeps a wounded process writing its own post mortem.
-struct SharedWriter(Mutex<RotatingFileWriter>);
+struct SharedWriter(Arc<Mutex<RotatingFileWriter>>);
 
 struct SharedGuard<'a>(MutexGuard<'a, RotatingFileWriter>);
 
@@ -255,16 +256,14 @@ impl<'a> MakeWriter<'a> for SharedWriter {
         SharedGuard(self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
-
-/// `MAKI_LOG` is ours and is taken literally, `MAKI_LOG=off` included.
-///
+/// `MAKI_LOG` is ours and is taken literally, `MAKI_LOG=off` included.///
 /// `RUST_LOG` belongs to every Rust program on the machine, and `EnvFilter`
 /// drops any target no directive names, so a `RUST_LOG=other_crate=debug` left
 /// in a shell profile for an unrelated project silenced maki entirely. We still
 /// read it, and a value that names a level decides ours, but a value that only
 /// lists other people's targets gets our level added underneath, so a foreign
 /// variable can add to our logs and never take them away.
-fn log_filter() -> EnvFilter {
+pub(crate) fn log_filter() -> EnvFilter {
     let read = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
     build_log_filter(read(LOG_ENV).as_deref(), read(LOG_ENV_SHARED).as_deref())
 }
@@ -301,27 +300,127 @@ fn sets_a_level(value: &str) -> bool {
 /// Logging is the first thing to set up and the last thing allowed to stop the
 /// program, but a failure here used to be swallowed whole, so an unwritable log
 /// dir looked exactly like an idle one: no logs, no reason, no clue.
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+///
+/// The sink hands the same writer to whoever files foreign records — the
+/// executor's log, forwarded over the connection — so those lines interleave
+/// with ours under one lock.
+pub fn init_logging(storage_config: &maki_config::StorageConfig) -> Option<LogSink> {
     let writer =
         match RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files) {
             Ok(writer) => writer,
             Err(error) => {
                 eprintln!("maki: logging disabled, cannot open the log file: {error}");
-                return;
+                return None;
             }
         };
+    let shared = Arc::new(Mutex::new(writer));
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(log_filter())
-        .with_writer(SharedWriter(Mutex::new(writer)))
+        .with_writer(SharedWriter(Arc::clone(&shared)))
         .init();
+    Some(LogSink::new(shared))
+}
+
+/// Logging for a process that owns no local state: every event becomes one
+/// JSON log line on the channel, in the same schema `init_logging` writes, so
+/// the receiving side files it verbatim. The channel is bounded by the caller;
+/// a full channel drops the line and counts it, and the next line that does
+/// get through reports the losses first.
+pub(crate) fn init_remote_logging(sender: flume::Sender<String>) {
+    let _ = tracing::subscriber::set_global_default(remote_logging_subscriber(sender));
+}
+
+fn remote_logging_subscriber(
+    sender: flume::Sender<String>,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(log_filter())
+        .with_writer(RemoteWriter {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+        })
+        .finish()
+}
+
+struct RemoteWriter {
+    sender: flume::Sender<String>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl<'a> MakeWriter<'a> for RemoteWriter {
+    type Writer = RemoteLine;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RemoteLine {
+            sender: self.sender.clone(),
+            dropped: Arc::clone(&self.dropped),
+            buf: Vec::new(),
+        }
+    }
+}
+
+struct RemoteLine {
+    sender: flume::Sender<String>,
+    dropped: Arc<AtomicU64>,
+    buf: Vec<u8>,
+}
+
+impl Write for RemoteLine {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for RemoteLine {
+    fn drop(&mut self) {
+        let mut line = match String::from_utf8(std::mem::take(&mut self.buf)) {
+            Ok(line) => line,
+            Err(_) => return,
+        };
+        while line.ends_with('\n') {
+            line.pop();
+        }
+        if line.is_empty() {
+            return;
+        }
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped > 0 && self.sender.try_send(dropped_summary(dropped)).is_ok() {
+            self.dropped.store(0, Ordering::Relaxed);
+        }
+        if self.sender.try_send(line).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Same shape as the formatter's records, so the receiver files it verbatim.
+fn dropped_summary(count: u64) -> String {
+    let timestamp = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string();
+    serde_json::json!({
+        "timestamp": timestamp,
+        "level": "WARN",
+        "fields": { "message": format!("{count} log events dropped while the brain was away") },
+        "target": "maki::remote_log",
+    })
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use super::{DEFAULT_LOG_LEVEL, build_log_filter, remote_logging_subscriber};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
@@ -352,5 +451,39 @@ mod tests {
         let rendered = build_log_filter(None, Some(FOREIGN)).to_string();
         assert!(rendered.contains(FOREIGN), "{FOREIGN} was dropped");
         assert!(rendered.contains(&DEFAULT_LOG_LEVEL.to_string()));
+    }
+
+    /// Scoped to the thread: `set_default`, never the global default, so the
+    /// test cannot blind every other test in the binary.
+    #[test]
+    fn remote_logging_forwards_events_and_counts_drops() {
+        let (tx, rx) = flume::bounded::<String>(2);
+        let _guard = tracing::subscriber::set_default(remote_logging_subscriber(tx));
+
+        tracing::warn!("kept one");
+        tracing::warn!("kept two");
+        tracing::warn!("dropped one");
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .contains("kept one")
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .contains("kept two")
+        );
+        assert!(rx.try_recv().is_err(), "the third line had nowhere to go");
+
+        tracing::warn!("after the drought");
+        let summary = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            summary.contains("1 log events dropped while the brain was away"),
+            "summary missing: {summary}"
+        );
+        let after = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(after.contains("after the drought"));
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -379,7 +379,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         None => startup_warnings.extend(trust.state.restricted_warning()),
     }
 
-    setup::init_logging(&stack.config.storage);
+    let log_sink = setup::init_logging(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
@@ -561,6 +561,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
+                // The executor's forwarded log records are filed through
+                // this, tagged with their origin.
+                log_sink: log_sink.clone(),
                 executor_push,
                 executor_socket,
             },

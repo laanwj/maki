@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -34,6 +34,18 @@ struct ProgressWatcher {
 pub struct NotificationHub {
     progress: Arc<std::sync::Mutex<ProgressWatchers>>,
     messages: Arc<std::sync::Mutex<Vec<flume::Sender<String>>>>,
+    logs: Arc<std::sync::Mutex<LogWatchers>>,
+}
+
+const PENDING_LOG_CAP: usize = 1024;
+
+/// Log watchers plus the lines that reached the hub before any of them: the
+/// executor replays its boot records the moment the brain connects, while
+/// the brain is still handshaking and has not subscribed yet.
+#[derive(Default)]
+struct LogWatchers {
+    senders: Vec<flume::Sender<String>>,
+    pending: VecDeque<String>,
 }
 
 pub struct ProgressGuard {
@@ -88,6 +100,20 @@ impl NotificationHub {
         rx
     }
 
+    /// `maki/log` notifications from an executor: complete log records, one
+    /// per line, for the brain to file into its own log. Lines that arrived
+    /// before the first watcher are drained into it, so the replayed boot
+    /// records survive the handshake window.
+    pub fn watch_logs(&self) -> flume::Receiver<String> {
+        let (tx, rx) = flume::unbounded();
+        let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+        for line in logs.pending.drain(..) {
+            let _ = tx.try_send(line);
+        }
+        logs.senders.push(tx);
+        rx
+    }
+
     fn route(&self, method: &str, params: Option<&Value>) {
         match method {
             "notifications/progress" => {
@@ -121,6 +147,23 @@ impl NotificationHub {
                 let messages = self.messages.lock().unwrap_or_else(|e| e.into_inner());
                 for tx in messages.iter() {
                     let _ = tx.try_send(data.to_owned());
+                }
+            }
+            "maki/log" => {
+                let Some(line) = params.and_then(|p| p["line"].as_str()) else {
+                    return;
+                };
+                let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+                if logs.senders.is_empty() {
+                    // The executor already bounded the loss on its side; the
+                    // cap here only guards a brain that never subscribes.
+                    if logs.pending.len() < PENDING_LOG_CAP {
+                        logs.pending.push_back(line.to_owned());
+                    }
+                    return;
+                }
+                for tx in logs.senders.iter() {
+                    let _ = tx.try_send(line.to_owned());
                 }
             }
             _ => {}
@@ -408,5 +451,46 @@ pub(crate) async fn reader_loop(
                 debug!(server = &**name, error = %e, line = trimmed, "non-JSON-RPC line from server");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maki_log_and_message_route_to_their_own_watchers() {
+        let hub = NotificationHub::default();
+        let logs = hub.watch_logs();
+        let messages = hub.watch_messages();
+
+        hub.route(
+            "maki/log",
+            Some(&serde_json::json!({ "line": "{\"level\":\"INFO\"}" })),
+        );
+        hub.route(
+            "notifications/message",
+            Some(&serde_json::json!({ "level": "info", "data": "flash" })),
+        );
+
+        assert_eq!(logs.try_recv().unwrap(), "{\"level\":\"INFO\"}");
+        assert_eq!(messages.try_recv().unwrap(), "flash");
+        assert!(logs.try_recv().is_err());
+        assert!(messages.try_recv().is_err());
+    }
+
+    /// The executor's replay arrives while the brain is still handshaking,
+    /// before the event loop subscribes; those lines wait for the first
+    /// watcher instead of vanishing.
+    #[test]
+    fn maki_log_lines_arriving_before_any_watcher_are_kept() {
+        let hub = NotificationHub::default();
+        hub.route("maki/log", Some(&serde_json::json!({ "line": "early" })));
+        let logs = hub.watch_logs();
+        hub.route("maki/log", Some(&serde_json::json!({ "line": "late" })));
+
+        assert_eq!(logs.try_recv().unwrap(), "early");
+        assert_eq!(logs.try_recv().unwrap(), "late");
+        assert!(logs.try_recv().is_err());
     }
 }

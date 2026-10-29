@@ -48,7 +48,7 @@ use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::agent::{
@@ -130,6 +130,9 @@ pub struct EventLoopParams {
     /// What `/trust` would grant and what the `[restricted]` indicator reports.
     /// `None` when the folder is trusted or has nothing to ask about.
     pub trust_question: Option<TrustQuestion>,
+    /// Files the executor's forwarded log records into the brain's own log.
+    /// `None` when the brain's log could not be opened.
+    pub log_sink: Option<maki_storage::log::LogSink>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -553,6 +556,8 @@ pub(crate) struct EventLoop<'t> {
     /// Brain/executor split: executor log messages (plugin notifications),
     /// and whether this process is the brain.
     executor_rx: Option<flume::Receiver<String>>,
+    executor_log_rx: Option<flume::Receiver<String>>,
+    log_sink: Option<maki_storage::log::LogSink>,
     split_mode: bool,
     /// One package command at a time. The work runs on its own thread, so
     /// without this a second `/packupdate` would race the first over the same
@@ -574,6 +579,7 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     ExecutorMessage(String),
+    ExecutorLog(String),
     Pack(Box<PackPreparation>),
     ModelsDiscovered,
 }
@@ -666,6 +672,7 @@ impl<'t> EventLoop<'t> {
             trust_question,
             executor_push,
             executor_socket,
+            log_sink,
         } = params;
         let split_mode = executor_push.is_some();
         // A `/reload` generation inherits the handles of the one before it,
@@ -692,29 +699,36 @@ impl<'t> EventLoop<'t> {
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors, executor_rx) = smol::block_on(async {
-            if let Some(push) = executor_push {
-                let (handle, errors) =
-                    mcp::start_brain(&cwd, project_config, Some(push), executor_socket).await;
-                // Split mode without a live executor is a brain with no
-                // workspace tools; fail the boot, not the user's session.
-                match &handle {
-                    Some(handle) => mcp::executor_ready(handle, Duration::from_secs(15))
-                        .await
-                        .map_err(|reason| eyre!("executor unavailable in split mode: {reason}"))?,
-                    None => {
-                        return Err(eyre!("split mode is on but the executor is not configured"));
+        let (mcp_handle, mcp_config_errors, executor_rx, executor_log_rx) =
+            smol::block_on(async {
+                if let Some(push) = executor_push {
+                    let (handle, errors) =
+                        mcp::start_brain(&cwd, project_config, Some(push), executor_socket).await;
+                    // Split mode without a live executor is a brain with no
+                    // workspace tools; fail the boot, not the user's session.
+                    match &handle {
+                        Some(handle) => mcp::executor_ready(handle, Duration::from_secs(15))
+                            .await
+                            .map_err(|reason| {
+                                eyre!("executor unavailable in split mode: {reason}")
+                            })?,
+                        None => {
+                            return Err(eyre!(
+                                "split mode is on but the executor is not configured"
+                            ));
+                        }
                     }
+                    let handle_ref = handle.as_ref();
+                    let rx = handle_ref
+                        .and_then(|h| h.watch_messages(mcp::config::EXECUTOR_SERVER_NAME));
+                    let log_rx =
+                        handle_ref.and_then(|h| h.watch_logs(mcp::config::EXECUTOR_SERVER_NAME));
+                    Ok((handle, errors, rx, log_rx))
+                } else {
+                    let (handle, errors) = mcp::start(&cwd, project_config).await;
+                    Ok((handle, errors, None, None))
                 }
-                let rx = handle
-                    .as_ref()
-                    .and_then(|h| h.watch_messages(mcp::config::EXECUTOR_SERVER_NAME));
-                Ok((handle, errors, rx))
-            } else {
-                let (handle, errors) = mcp::start(&cwd, project_config).await;
-                Ok((handle, errors, None))
-            }
-        })?;
+            })?;
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -808,6 +822,8 @@ impl<'t> EventLoop<'t> {
             pack_tx,
             pack_rx,
             executor_rx,
+            executor_log_rx,
+            log_sink,
             split_mode,
             pack_running: false,
             _model_fetch_task: bg.task,
@@ -928,6 +944,11 @@ impl<'t> EventLoop<'t> {
         {
             sel = sel.recv(rx, |res| res.ok().map(Wake::ExecutorMessage));
         }
+        if let Some(rx) = &self.executor_log_rx
+            && !rx.is_disconnected()
+        {
+            sel = sel.recv(rx, |res| res.ok().map(Wake::ExecutorLog));
+        }
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         sel = sel.recv(&self.models_rx, |res| {
             res.ok().map(|()| Wake::ModelsDiscovered)
@@ -955,10 +976,33 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::ExecutorMessage(message) => self.focused_app().flash(message),
+            Wake::ExecutorLog(line) => self.file_executor_log(line),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
             Wake::ModelsDiscovered => self.rebuild_models(),
         }
         Ok(())
+    }
+
+    /// The executor owns no local state, so its log rides the connection and
+    /// lands here. `origin` is what tells the record from a brain-side one
+    /// once it sits in our log.
+    fn file_executor_log(&self, line: String) {
+        let Some(sink) = &self.log_sink else {
+            return;
+        };
+        let filed = match serde_json::from_str::<Value>(&line) {
+            Ok(mut record) => {
+                record["origin"] = Value::String("executor".into());
+                record.to_string()
+            }
+            Err(error) => {
+                warn!(error = %error, "unparsable executor log line; filed untagged");
+                line
+            }
+        };
+        if let Err(error) = sink.write_line(&filed) {
+            warn!(error = %error, "cannot file executor log line");
+        }
     }
 
     /// The one save trigger. A checkpoint writes only on a real change, so

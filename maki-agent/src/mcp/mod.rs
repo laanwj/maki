@@ -778,6 +778,15 @@ impl McpHandle {
             .map(|hub| hub.watch_messages())
     }
 
+    /// Log records the executor forwards over `maki/log` notifications.
+    pub fn watch_logs(&self, server: &str) -> Option<flume::Receiver<String>> {
+        let idx = self.index.load();
+        idx.transports
+            .get(server)
+            .and_then(|t| t.notification_hub())
+            .map(|hub| hub.watch_logs())
+    }
+
     pub async fn list_resources(
         &self,
         server: &str,
@@ -2097,6 +2106,7 @@ url = "https://mcp.example.com/mcp"
                 listener,
                 Arc::new(ProgressHandler),
                 flume::unbounded().1,
+                flume::unbounded().1,
             ))
             .detach();
 
@@ -2151,6 +2161,56 @@ url = "https://mcp.example.com/mcp"
         });
     }
 
+    /// The production sequence, which dropped the replay for a day: the
+    /// executor's log pump fires the buffered boot records the moment the
+    /// transport connects, the brain finishes its handshake, and only then
+    /// does the event loop subscribe. The hub has to keep the lines that
+    /// arrived in between.
+    #[cfg(unix)]
+    #[test]
+    fn replayed_executor_logs_survive_the_handshake_window() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("e.sock");
+            let listener = async_net::unix::UnixListener::bind(&path).unwrap();
+            let (log_tx, log_rx) = flume::unbounded::<String>();
+            log_tx
+                .send(r#"{"level":"INFO","fields":{"message":"executor listening"}}"#.to_string())
+                .unwrap();
+            smol::spawn(server::serve_unix(
+                listener,
+                Arc::new(NoopHandler),
+                flume::unbounded().1,
+                log_rx,
+            ))
+            .detach();
+
+            let mut config = McpConfig::default();
+            config.mcp.insert(
+                config::EXECUTOR_SERVER_NAME.into(),
+                RawServerConfig::runtime(RawTransport::Socket(config::RawSocketFields {
+                    path: path.clone(),
+                })),
+            );
+            let handle = start_with_config(config).unwrap();
+            handle.ready().await;
+
+            let logs = handle.watch_logs(config::EXECUTOR_SERVER_NAME).unwrap();
+            let line = futures_lite::future::race(
+                async { logs.recv_async().await.ok().unwrap_or_default() },
+                async {
+                    smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                    String::new()
+                },
+            )
+            .await;
+            assert!(
+                line.contains("executor listening"),
+                "the replayed boot record was lost: {line:?}"
+            );
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn executor_ready_answers_running_or_failure() {
@@ -2161,6 +2221,7 @@ url = "https://mcp.example.com/mcp"
             smol::spawn(server::serve_unix(
                 listener,
                 Arc::new(NoopHandler),
+                flume::unbounded().1,
                 flume::unbounded().1,
             ))
             .detach();
@@ -2202,6 +2263,7 @@ url = "https://mcp.example.com/mcp"
             smol::spawn(server::serve_unix(
                 listener,
                 Arc::new(NoopHandler),
+                flume::unbounded().1,
                 flume::unbounded().1,
             ))
             .detach();

@@ -26,7 +26,12 @@ use maki_lua::{PluginHost, UiAction};
 use serde_json::{Value, json};
 use tracing::info;
 
+use crate::setup;
+
 const SOCKET_MODE: u32 = 0o660;
+/// Log lines kept while no brain is connected; beyond this they are dropped
+/// with a count the brain sees when it returns.
+const LOG_LINE_BUFFER: usize = 1024;
 
 struct ExecutorHandler {
     registry: Arc<ToolRegistry>,
@@ -442,10 +447,10 @@ fn write_pushed_skills(
 }
 
 pub fn run(socket: PathBuf, workspace: Option<PathBuf>) -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init();
+    // The executor keeps no local state: its log rides the MCP connection to
+    // the brain, buffered while nobody is connected.
+    let (log_tx, log_rx) = flume::bounded::<String>(LOG_LINE_BUFFER);
+    setup::init_remote_logging(log_tx);
     if let Some(workspace) = workspace {
         std::env::set_current_dir(&workspace)
             .with_context(|| format!("chdir {}", workspace.display()))?;
@@ -491,7 +496,7 @@ pub fn run(socket: PathBuf, workspace: Option<PathBuf>) -> Result<()> {
         .with_context(|| format!("chmod {}", socket.display()))?;
 
     info!(socket = %socket.display(), "executor listening");
-    smol::block_on(serve_unix(listener, handler, notify_rx)).context("serve")?;
+    smol::block_on(serve_unix(listener, handler, notify_rx, log_rx)).context("serve")?;
     Ok(())
 }
 
@@ -854,6 +859,7 @@ maki.api.register_tool({
                 listener,
                 handler,
                 flume::unbounded().1,
+                flume::unbounded().1,
             ))
             .detach();
 
@@ -945,6 +951,7 @@ maki.api.register_tool({
                 listener,
                 handler,
                 flume::unbounded().1,
+                flume::unbounded().1,
             ))
             .detach();
 
@@ -1020,6 +1027,7 @@ maki.api.register_tool({
             smol::spawn(maki_agent::mcp::server::serve_unix(
                 listener,
                 handler,
+                flume::unbounded().1,
                 flume::unbounded().1,
             ))
             .detach();
@@ -1134,6 +1142,7 @@ maki.api.register_tool({
             smol::spawn(maki_agent::mcp::server::serve_unix(
                 listener,
                 handler,
+                flume::unbounded().1,
                 flume::unbounded().1,
             ))
             .detach();
@@ -1271,6 +1280,7 @@ maki.api.register_tool({
             smol::spawn(maki_agent::mcp::server::serve_unix(
                 listener,
                 handler,
+                flume::unbounded().1,
                 flume::unbounded().1,
             ))
             .detach();

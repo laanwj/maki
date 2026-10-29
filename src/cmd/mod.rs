@@ -192,7 +192,7 @@ fn cli_stack(
             Ok(config)
         },
     )?;
-    setup::init_logging(&config.storage);
+    let _ = setup::init_logging(&config.storage);
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     report_warnings(warnings);

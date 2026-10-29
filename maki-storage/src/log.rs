@@ -3,6 +3,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::paths;
 
@@ -275,6 +276,34 @@ impl Write for RotatingFileWriter {
     }
 }
 
+/// Files log lines that did not come from this process's own instrumentation
+/// into the same rotating log the tracing subscriber writes through: both
+/// hold one mutex, so lines interleave under it.
+///
+/// For records that arrive over a channel — the executor's log, forwarded by
+/// the brain.
+pub struct LogSink(Arc<Mutex<RotatingFileWriter>>);
+
+impl Clone for LogSink {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl LogSink {
+    pub fn new(shared: Arc<Mutex<RotatingFileWriter>>) -> Self {
+        Self(shared)
+    }
+
+    /// Appends one complete line. The caller reports the error: a sink that
+    /// cannot write is a disk problem worth surfacing, not swallowing.
+    pub fn write_line(&self, line: &str) -> io::Result<()> {
+        let mut writer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
@@ -287,6 +316,29 @@ mod tests {
 
     fn test_writer(dir: &Path) -> RotatingFileWriter {
         RotatingFileWriter::with_limits(dir, TEST_MAX_BYTES, TEST_MAX_FILES).unwrap()
+    }
+
+    /// The subscriber and a LogSink share one writer, so their lines have to
+    /// interleave rather than race.
+    #[test]
+    fn log_sink_lines_interleave_with_the_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        fs::create_dir(&dir).unwrap();
+        let shared = Arc::new(Mutex::new(test_writer(&dir)));
+        let sink = LogSink::new(Arc::clone(&shared));
+
+        shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .write_all(b"subscriber line\n")
+            .unwrap();
+        sink.write_line("sink line").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(file_path(&dir, 0)).unwrap(),
+            "subscriber line\nsink line\n"
+        );
     }
 
     fn read_all_logs(dir: &Path) -> String {

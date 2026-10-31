@@ -562,7 +562,7 @@ pub enum Request {
         input: Value,
         live: LiveCtx,
         ctx: Box<LuaCtx>,
-        reply: flume::Sender<Option<String>>,
+        reply: flume::Sender<Option<HeaderResult>>,
     },
     ViewProgress {
         call_id: Arc<str>,
@@ -3829,7 +3829,12 @@ async fn restore_view(lua: &Lua, item: &RestoreItem) -> Option<RestoreReply> {
             .ok()?
             .await
             .ok()?;
-        let state = ret.into_iter().next().unwrap_or(LuaValue::Nil);
+        let mut ret = ret.into_iter();
+        let state = ret.next().unwrap_or(LuaValue::Nil);
+        let header = match ret.next() {
+            None | Some(LuaValue::Nil) => None,
+            Some(v) => header_result_from_lua(&item.tool, Ok(v)).snapshot(),
+        };
         let output = lua.create_string(&item.output).ok()?;
         let thread = lua.create_thread(done_fn).ok()?;
         thread
@@ -3837,18 +3842,20 @@ async fn restore_view(lua: &Lua, item: &RestoreItem) -> Option<RestoreReply> {
             .ok()?
             .await
             .ok()?;
-        Some(())
+        Some(header)
     };
-    if scope.scope_future(run).await.is_none() {
+    let restored = scope.scope_future(run).await;
+    if restored.is_none() {
         tracing::warn!(tool = &*item.tool, "view restore failed");
     }
+    let header = restored.flatten();
 
     run_inline_tasks(lua, &scope).await;
     replay_clicks(lua, &scope, &item.clicks, &item.tool).await;
 
     let body = resolve_root_buf(scope.handle()).map(|buf| buf.take());
     drop(scope);
-    Some(RestoreReply { body, header: None })
+    Some(RestoreReply { body, header })
 }
 
 /// Runs `maki.async.run` tasks queued during restore inline, so their
@@ -4556,7 +4563,8 @@ fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
 /// the UI keeps polling it until the handler's own `LiveToolBuf` takes over.
 /// A view's `start` runs exactly like a tool's: same task scope, same
 /// live-buffer channel. Its returns are the difference: a state value the
-/// runtime hands to progress/done, and an optional header summary. The task
+/// runtime hands to progress/done, and an optional header result, built from
+/// a plain string or a buf the same way a tool's `header` return is. The task
 /// handle and claim come back so clicks route to the view's bufs for the
 /// call's whole life, the way a native tool's would.
 async fn run_view_start(
@@ -4568,7 +4576,7 @@ async fn run_view_start(
     ctx: Box<LuaCtx>,
 ) -> (
     Option<RegistryKey>,
-    Option<String>,
+    Option<HeaderResult>,
     TaskHandle,
     Arc<BufsClaim>,
 ) {
@@ -4587,8 +4595,8 @@ async fn run_view_start(
             Some(v) => lua.create_registry_value(v.clone()).ok(),
         };
         let summary = match ret.get(1) {
-            Some(LuaValue::String(s)) => s.to_str().ok().map(|s| s.to_owned()),
-            _ => None,
+            None | Some(LuaValue::Nil) => None,
+            Some(v) => Some(header_result_from_lua(tool, Ok(v.clone()))),
         };
         Ok::<_, mlua::Error>((state, summary))
     };

@@ -11,7 +11,9 @@ maki.api.register_tool_view({
   start = function(input, ctx)
     local buf = maki.ui.buf()
     ctx:live_buf(buf)
-    return { buf = buf, opts = dir_listing.opts(ctx) }, shorten_path(input.path or "")
+    local header = maki.ui.buf({ scratch = true })
+    header:line({ { shorten_path(input.path or ""), "path" } })
+    return { buf = buf, opts = dir_listing.opts(ctx) }, header
   end,
 
   done = function(state, _, output, _)

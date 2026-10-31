@@ -123,4 +123,10 @@ function M.summary(input)
   return s
 end
 
+function M.header(input)
+  local buf = maki.ui.buf({ scratch = true })
+  buf:line({ { M.summary(input), "path" } })
+  return buf
+end
+
 return M

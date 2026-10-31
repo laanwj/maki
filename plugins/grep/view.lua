@@ -9,7 +9,7 @@ maki.api.register_tool_view({
   start = function(input, ctx)
     local buf = maki.ui.buf()
     ctx:live_buf(buf)
-    return { buf = buf, opts = grep_view.view_opts(ctx) }, grep_view.summary(input)
+    return { buf = buf, opts = grep_view.view_opts(ctx) }, grep_view.header(input)
   end,
 
   done = function(state, _, output, is_error)

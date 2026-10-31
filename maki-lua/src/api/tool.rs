@@ -778,7 +778,10 @@ fn register_tool(
 ///   start(input, ctx)                  Paint the preview, exactly like a
 ///     tool's own `start` (`ctx:live_buf`, `maki.ui`, config reads). May
 ///     return a per-call state value, which `progress` and `done` get back,
-///     and optionally a header summary as the second return.
+///     and optionally a header as the second return: a plain string, or a
+///     buf whose first line is the styled header, the same contract as a
+///     tool's `header` fn. The buf's snapshot is taken, so pass a dedicated
+///     buffer, never the live body.
 ///   progress(state, payload)           One call per payload the tool emits
 ///     with `ctx:progress(...)`; the payload's JSON shape is the tool's own
 ///     contract with its view.
@@ -791,12 +794,13 @@ fn register_tool(
 /// Session restore replays `start(input)` then `done(state, input, output)` —
 /// no live executor needed, and the restored row keeps its click handlers.
 /// `ctx:live_buf` in `start` publishes the body to restore from; a view
-/// without `start` leaves restores to generic rendering.
+/// without `start` leaves restores to generic rendering. A header buf
+/// returned by `start` repaints the styled header on restore.
 ///
 /// @param spec table View specification:
 ///   tool     (string)   Required. Qualified tool name (`server.tool`); the
 ///     executor's own tools keep their bare names.
-///   start    (function) Optional. `function(input, ctx) -> state[, summary]`.
+///   start    (function) Optional. `function(input, ctx) -> state[, header]`.
 ///   progress (function) Optional. `function(state, payload)`.
 ///   done     (function) Optional. `function(state, input, output, is_error)`.
 /// @return
@@ -875,7 +879,7 @@ fn register_tool_view(lua: &Lua, spec: Table) -> LuaResult<()> {
                 return None;
             }
             reply_rx.recv_async().await.ok().flatten()
-        }) as BoxFuture<'static, Option<String>>
+        }) as BoxFuture<'static, Option<HeaderResult>>
     });
 
     let progress_tx = tx.clone();

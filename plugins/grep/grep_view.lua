@@ -160,4 +160,18 @@ function M.summary(input)
   return s
 end
 
+function M.header(input)
+  local buf = maki.ui.buf({ scratch = true })
+  local pattern = (input.pattern or ""):gsub('"$', "")
+  local spans = { { pattern, "tool" } }
+  if input.include then
+    spans[#spans + 1] = { " [" .. input.include .. "]", "dim" }
+  end
+  if input.path then
+    spans[#spans + 1] = { " " .. shorten_path(input.path), "path" }
+  end
+  buf:line(spans)
+  return buf
+end
+
 return M

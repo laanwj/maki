@@ -16,7 +16,9 @@ use crate::mcp::{
 use crate::permissions::{LayerAnswer, PromptLayers};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
-use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
+use crate::tools::registry::{
+    BoxFuture, HeaderResult, InstalledHook, RegisteredTool, Tool, ToolInvocation,
+};
 use crate::tools::{
     CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
     ToolLive, ViewDone, ViewHook, ViewStart, truncate_bytes,
@@ -729,14 +731,15 @@ async fn run_native_tool(
         .tool_view(&tool_id)
         .filter(|_| origin.is_model() && !entry.tool.has_own_display());
     let (summary, render_header) = if let Some(view) = &view {
-        let summary = (view.start)(ViewStart {
+        let header = (view.start)(ViewStart {
             call_id: Arc::from(id.as_str()),
             tool: Arc::clone(&tool_id),
             input: input.clone(),
             ctx: ctx.clone(),
         })
-        .await;
-        (summary.unwrap_or_else(|| tool_id.to_string()), None)
+        .await
+        .unwrap_or_else(|| HeaderResult::plain(tool_id.to_string()));
+        (header.text(), header.snapshot())
     } else {
         let header_result = invocation.start_header().await;
         (header_result.text(), header_result.snapshot())
@@ -1091,18 +1094,20 @@ async fn execute_mcp_tool(
     // preview and the final body; the executor only executes.
     let view = ctx.registry.tool_view(&tool).filter(|_| origin.is_model());
     if let Some(view) = &view {
-        let summary = (view.start)(ViewStart {
+        let header = (view.start)(ViewStart {
             call_id: Arc::from(id),
             tool: Arc::clone(&tool),
             input: input.clone(),
             ctx: ctx.clone(),
         })
-        .await;
+        .await
+        .unwrap_or_else(|| HeaderResult::plain(tool.to_string()));
+        let summary = header.text();
         let start = ToolStartEvent {
             id: id.to_owned(),
             tool: Arc::clone(&tool),
-            summary: summary.unwrap_or_else(|| tool.to_string()),
-            render_header: None,
+            summary,
+            render_header: header.snapshot(),
             annotation: None,
             input: None,
             raw_input: Some(input.clone()),
@@ -2825,7 +2830,11 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(format!("start:{}", vs.input["code"].as_str().unwrap_or("")));
-                        Box::pin(async { Some("custom header".to_string()) })
+                        Box::pin(async {
+                            Some(crate::tools::HeaderResult::plain(
+                                "custom header".to_owned(),
+                            ))
+                        })
                     }),
                     progress: Arc::new(|_, _| Box::pin(async {})),
                     done: Arc::new(move |vd: crate::tools::ViewDone| {
@@ -2912,7 +2921,9 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(format!("start:{}", vs.input["flag"].as_str().unwrap_or("")));
-                        Box::pin(async { Some("view header".to_string()) })
+                        Box::pin(async {
+                            Some(crate::tools::HeaderResult::plain("view header".to_owned()))
+                        })
                     }),
                     progress: Arc::new(|_, _| Box::pin(async {})),
                     done: Arc::new(move |vd: crate::tools::ViewDone| {

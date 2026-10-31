@@ -1849,7 +1849,10 @@ mod tests {
                 ctx,
             })
             .await;
-            assert_eq!(summary.as_deref(), Some("starting python"));
+            assert_eq!(
+                summary.map(|h| h.text()),
+                Some("starting python".to_owned())
+            );
             (view.progress)(Arc::from("c1"), serde_json::json!("a line")).await;
             // Clicks route to the view's buf while the call runs...
             host.event_handle().request_click("c1".to_string(), 1);
@@ -1878,6 +1881,62 @@ mod tests {
             };
             assert_eq!(message, expected);
         }
+    }
+
+    #[test]
+    fn view_start_header_accepts_a_styled_buffer() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::with_role(
+            Arc::clone(&reg),
+            crate::role::HostRole::Brain,
+            Interaction::Tty,
+            true,
+        )
+        .unwrap();
+        host.load_source(
+            "t",
+            r#"maki.api.register_tool_view({
+                tool = "python",
+                start = function(input, ctx)
+                    local body = maki.ui.buf()
+                    body:line("body line")
+                    ctx:live_buf(body)
+                    local header = maki.ui.buf({ scratch = true })
+                    header:line({
+                        { "8 lines of python", "tool" },
+                        { " in ", "dim" },
+                        { ".venv", "path" },
+                    })
+                    return { }, header
+                end,
+                done = function() end,
+            })"#,
+        )
+        .unwrap();
+        let view = reg.tool_view("python").expect("view registered");
+
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let event_tx = maki_agent::EventSender::new(tx, 0);
+            let ctx = maki_agent::tools::test_support::stub_ctx_with(
+                &maki_agent::AgentMode::Build,
+                Some(&event_tx),
+                None,
+            );
+            let summary = (view.start)(maki_agent::tools::ViewStart {
+                call_id: Arc::from("c1"),
+                tool: Arc::from("python"),
+                input: serde_json::json!({}),
+                ctx,
+            })
+            .await;
+            let header = summary.expect("view start must report a header");
+            assert_eq!(header.text(), "8 lines of python in .venv");
+            assert!(
+                header.snapshot().is_some(),
+                "a buf header must carry a snapshot"
+            );
+        });
     }
 
     #[test_case("progress")]

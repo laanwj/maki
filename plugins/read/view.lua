@@ -10,7 +10,7 @@ maki.api.register_tool_view({
   start = function(input, ctx)
     local buf = maki.ui.buf()
     ctx:live_buf(buf)
-    return { buf = buf, opts = read_view.view_opts(ctx) }, read_view.summary(input)
+    return { buf = buf, opts = read_view.view_opts(ctx) }, read_view.header(input)
   end,
 
   done = function(state, input, output, is_error)

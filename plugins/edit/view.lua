@@ -11,7 +11,7 @@ local function register(name, blocks_from)
     start = function(input, ctx)
       local buf = edit_view.diff_view(blocks_from(input), input.path)
       ctx:live_buf(buf)
-      return { buf = buf }, edit_view.summary(input)
+      return { buf = buf }, edit_view.header(input)
     end,
 
     done = function(state, _, output, is_error)

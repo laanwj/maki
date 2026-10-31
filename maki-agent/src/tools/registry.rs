@@ -296,11 +296,12 @@ pub type InstalledHook = Arc<Box<dyn ToolHook>>;
 pub type InstalledAgentHook = Arc<Box<dyn AgentHook>>;
 
 /// Lifecycle of one view invocation: `start` paints the preview and reports
-/// the header text, `progress` consumes the tool's structured payloads,
-/// `done` paints the final body from the result text.
+/// the header (plain text or a styled snapshot), `progress` consumes the
+/// tool's structured payloads, `done` paints the final body from the result
+/// text.
 #[derive(Clone)]
 pub struct ViewHook {
-    pub start: Arc<dyn Fn(ViewStart) -> BoxFuture<'static, Option<String>> + Send + Sync>,
+    pub start: Arc<dyn Fn(ViewStart) -> BoxFuture<'static, Option<HeaderResult>> + Send + Sync>,
     pub progress: Arc<dyn Fn(Arc<str>, Value) -> BoxFuture<'static, ()> + Send + Sync>,
     pub done: Arc<dyn Fn(ViewDone) -> BoxFuture<'static, ()> + Send + Sync>,
 }

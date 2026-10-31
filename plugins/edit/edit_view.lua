@@ -170,6 +170,12 @@ function M.summary(input)
   return shorten_path(input.path or "")
 end
 
+function M.header(input)
+  local buf = maki.ui.buf({ scratch = true })
+  buf:line({ { M.summary(input), "path" } })
+  return buf
+end
+
 -- The per-tool input shapes, shared by the plugin's restores and the view.
 function M.blocks_edit(input)
   return { { old = input.old_string, new = input.new_string } }

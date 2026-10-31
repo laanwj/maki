@@ -148,8 +148,4 @@ function M.render_index(skeleton, path, ctx, ext, line_meta)
   return buf, M.render_header(path, line_count)
 end
 
-function M.summary(input)
-  return shorten_path(input.path or "")
-end
-
 return M

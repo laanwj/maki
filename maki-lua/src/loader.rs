@@ -2155,7 +2155,8 @@ mod tests {
     }
 
     /// A restored row for a tool the brain never ran replays its view's
-    /// start+done, so the body comes back instead of generic text.
+    /// start+done, so the body comes back instead of generic text, and a
+    /// header buf repaints the row's header via ToolHeaderSnapshot.
     #[test]
     fn brain_host_replays_a_view_on_restore() {
         let reg = Arc::new(ToolRegistry::new());
@@ -2174,7 +2175,9 @@ mod tests {
                     local buf = maki.ui.buf()
                     buf:line("preview " .. (input.code or "?"))
                     ctx:live_buf(buf)
-                    return { buf = buf }, "starting python"
+                    local header = maki.ui.buf({ scratch = true })
+                    header:line({ { "starting ", "dim" }, { "python", "tool" } })
+                    return { buf = buf }, header
                 end,
                 done = function(state, input, output, is_error)
                     state.buf:line("done " .. output)
@@ -2204,12 +2207,24 @@ mod tests {
         );
         handle.wait_restore_complete_for_test();
 
+        let mut header: Option<String> = None;
         let snapshot = rx
             .drain()
             .filter_map(|env| match env.event {
                 maki_agent::AgentEvent::ToolSnapshot { id, snapshot, .. } => {
                     assert_eq!(id, "r1");
                     Some(snapshot)
+                }
+                maki_agent::AgentEvent::ToolHeaderSnapshot { id, snapshot, .. } => {
+                    assert_eq!(id, "r1");
+                    header = Some(
+                        snapshot
+                            .lines
+                            .first()
+                            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+                            .unwrap_or_default(),
+                    );
+                    None
                 }
                 _ => None,
             })
@@ -2223,6 +2238,11 @@ mod tests {
             .join("\n");
         assert!(text.contains("preview print(1)"), "got: {text}");
         assert!(text.contains("done result text"), "got: {text}");
+        assert_eq!(
+            header.as_deref(),
+            Some("starting python"),
+            "a header buf must repaint the row's header"
+        );
     }
 
     /// The real builtin views replay too: a restored write row shows the

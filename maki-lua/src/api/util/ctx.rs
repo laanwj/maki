@@ -27,7 +27,12 @@ fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
         cell.root_buf = Some(Arc::clone(&shared));
         (cell.live.clone(), cell.live_sink.clone())
     };
-    if let Some(live) = live {
+    // The executor's per-call event channel has no reader for a live buf, so
+    // publishing there is dropped work. The sink is different: it is an
+    // in-process callback the caller owns, so it keeps flowing.
+    if !crate::role::current(lua).is_executor()
+        && let Some(live) = live
+    {
         let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
             id: live.tool_use_id.clone(),
             body: Arc::clone(&shared),

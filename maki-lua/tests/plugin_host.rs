@@ -2529,12 +2529,19 @@ fn memory_pressure_evicts_warm_views_and_recovers_allocations() {
     );
     host.load_source("ballast_plugin", &src).unwrap();
 
+    // An executor host publishes no live-buf events (no reader exists for
+    // them there), so the harness takes the buf through the caller's sink.
     let mut first_buf = None;
     for i in 0..CALLS {
-        let (ctx, rx) = warm_ctx(&format!("ballast-{i}"));
+        let (tx, rx) = flume::unbounded::<maki_agent::tools::ToolLive>();
+        let mut ctx = warm_ctx(&format!("ballast-{i}")).0;
+        ctx.live_sink = Some(tx);
         exec_warm_tool(&reg, "ballast", &ctx).expect("ballast call");
         if i == 0 {
-            first_buf = recv_live_buf(&rx, "ballast-0");
+            first_buf = rx.drain().find_map(|ev| match ev {
+                maki_agent::tools::ToolLive::Buf(buf) => Some(buf),
+                _ => None,
+            });
         }
     }
     let first_buf = first_buf.expect("first live buf");

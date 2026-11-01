@@ -2725,6 +2725,10 @@ fn spawn_async_task(
 
     let lua = lua.clone();
     let g = Rc::clone(gate);
+    // The executor renders nothing; an async task finishing there has no
+    // reader for a snapshot, and the per-call channel it would land on is
+    // usually already gone.
+    let executor_role = crate::role::current(&lua).is_executor();
 
     ex.spawn(async move {
         let slot = Some(g.admit((!detached).then(|| DrainHold::new(&g))).await);
@@ -2744,7 +2748,8 @@ fn spawn_async_task(
             tracing::debug!(error = %e, tool_id, "async.run: task failed");
         }
 
-        if let Some(ref live) = task.live_ctx
+        if !executor_role
+            && let Some(ref live) = task.live_ctx
             && let Some(buf) = task.owner.as_ref().and_then(|c| c.root_buf())
         {
             // Always `read`, not `read_if_dirty`: the dirty flag is
@@ -4783,16 +4788,22 @@ async fn run_tool_call(
                     let cell = lock_cell(&handle);
                     (cell.live.clone(), cell.live_sink.clone())
                 };
-                if let Some(buf) = resolve_root_buf(&handle) {
-                    if let Some(live) = live {
-                        let _ = live.event_tx.send(maki_agent::AgentEvent::LiveToolBuf {
+                // The executor's per-call channel has no reader for a live
+                // buf; the sink is an in-process callback the caller owns
+                // and keeps flowing.
+                let root = resolve_root_buf(&handle);
+                if !crate::role::current(&lua).is_executor()
+                    && let (Some(buf), Some(live)) = (root.as_ref(), live.as_ref())
+                {
+                    let _ = live
+                        .event_tx
+                        .send(maki_agent::AgentEvent::LiveToolBuf {
                             id: live.tool_use_id.clone(),
-                            body: Arc::clone(&buf),
+                            body: Arc::clone(buf),
                         });
-                    }
-                    if let Some(sink) = sink {
-                        let _ = sink.send(ToolLive::Buf(buf));
-                    }
+                }
+                if let (Some(buf), Some(sink)) = (root.as_ref(), sink.as_ref()) {
+                    let _ = sink.send(ToolLive::Buf(Arc::clone(buf)));
                 }
                 dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, finish_rx).await
             }
@@ -5113,6 +5124,9 @@ pub fn spawn(
                             let shutdown_ref = Arc::clone(&rt.shutdown);
                             let g = Rc::clone(&gate);
                             let cancel = ctx.cancel.clone();
+                            // The executor renders nothing: whatever display
+                            // its tools built, no reader exists for it there.
+                            let executor_role = crate::role::current(&rt.lua).is_executor();
                             ex.spawn(async move {
                                 let _hold = nested.then(|| DrainHold::new(&g));
                                 let slot = if nested {
@@ -5126,7 +5140,7 @@ pub fn spawn(
                                         }
                                     }
                                 };
-                                let res = covered(
+                                let mut res = covered(
                                     slot,
                                     run_tool_call(
                                         lua.clone(),
@@ -5143,6 +5157,9 @@ pub fn spawn(
                                     ),
                                 )
                                 .await;
+                                if executor_role {
+                                    res.strip_display();
+                                }
                                 let _ = reply.send(res);
                             })
                             .detach();
@@ -5303,6 +5320,13 @@ pub fn spawn(
                             input,
                             reply,
                         } => {
+                            // The executor renders nothing, so its tools'
+                            // header callbacks never run there; dispatch gets
+                            // the plain-name fallback.
+                            if crate::role::current(&rt.lua).is_executor() {
+                                let _ = reply.send(HeaderResult::plain(tool.to_string()));
+                                continue;
+                            }
                             let res =
                                 compute_header(&rt.lua, &rt.plugins, &plugin, &tool, input).await;
                             let _ = reply.send(res);
@@ -5719,6 +5743,12 @@ pub fn spawn(
                                 let _ = reply.send(());
                                 continue;
                             };
+                            // A start callback paints a preview; the executor
+                            // renders nothing, so it never runs there.
+                            if crate::role::current(&rt.lua).is_executor() {
+                                let _ = reply.send(());
+                                continue;
+                            }
                             let lua = rt.lua.clone();
                             let g = Rc::clone(&gate);
                             ex.spawn(async move {

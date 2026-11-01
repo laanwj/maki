@@ -713,8 +713,8 @@ fn register_prompt(
 ///                              Must return a string or a table with any of these fields:
 ///                                llm_output  (string)  Result text for the model or the calling code.
 ///                                is_error    (boolean) When true, the result is treated as an error.
-///                                body        (BufHandle) Rich rendered body shown in the UI.
-///                                header      (BufHandle) One-line header shown before the body.
+///                                body        (BufHandle) Rich rendered body shown in the UI. Ignored on executor-role hosts: they render nothing, the brain paints the call from its own view.
+///                                header      (BufHandle) One-line header shown before the body. Ignored on executor-role hosts.
 ///                                format      (string)  "plain" (default) or "markdown".
 ///                                annotation  (string)  Short label shown next to the tool call.
 ///                                written_path (string) Path of a file written by the tool.
@@ -726,9 +726,9 @@ fn register_prompt(
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
-///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
-///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
-///   start           (function) Optional. Called when the tool call starts, before the handler runs.
+///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header. Never called on executor-role hosts.
+///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`. Never called on executor-role hosts.
+///   start           (function) Optional. Called when the tool call starts, before the handler runs. Never called on executor-role hosts.
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
@@ -1946,6 +1946,15 @@ pub(crate) struct ToolCallReply {
 }
 
 impl ToolCallReply {
+    /// The executor half of the split renders nothing: its replies carry no
+    /// display, because no reader exists for it. The brain paints the call
+    /// from its own view of the same input and output.
+    pub(crate) fn strip_display(&mut self) {
+        self.snapshot = None;
+        self.header = None;
+        self.live_buf = None;
+    }
+
     pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {

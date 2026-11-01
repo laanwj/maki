@@ -109,6 +109,13 @@ an earlier one, and a tool with no registered view gets generic MCP rendering.
 A view also drives a single-process tool that has no `header`/`start` of its
 own, so one view file serves both modes.
 
+Executor-role hosts run no display half at all: `header`, `start`, `restore`
+callbacks never fire there, and `body`/`header` in a handler reply are
+dropped. Rendering happens on the brain, from the view and the call's input
+and output. A handler that builds a rich display itself (rendered buffers,
+async highlighting) still pays that CPU on the executor, so when the tool has
+a brain-side view, gate the building on single-process mode.
+
 Executor-side, a tool emits its feed with `ctx:progress(value)`. The payload
 is arbitrary JSON, and its shape is the tool's own contract with its view.
 

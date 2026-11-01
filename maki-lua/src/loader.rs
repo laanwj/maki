@@ -2293,6 +2293,143 @@ mod tests {
         assert!(err.to_string().contains(EXECUTOR_GATE), "got: {err}");
     }
 
+    /// The executor renders nothing. Display callbacks never run there, a
+    /// handler's `body`/`header` reply fields are dropped, and no render
+    /// event leaves the call, however late the task that produced it: the
+    /// per-call channel an executor serves dies with the call, so a late
+    /// `LiveToolBuf` or `ToolSnapshot` could only warn about a drop.
+    #[test]
+    fn executor_host_runs_no_display_half() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::executor(Arc::clone(&reg)).unwrap();
+        host.load_source(
+            "t",
+            r#"
+maki.api.register_tool({
+    name = "displayed",
+    description = "d",
+    schema = { type = "object", properties = {} },
+    header = function() return "styled header" end,
+    start = function(input, ctx)
+        local buf = maki.ui.buf()
+        buf:line("preview")
+        ctx:live_buf(buf)
+    end,
+    handler = function(input, ctx)
+        local body = maki.ui.buf()
+        body:line("body line")
+        maki.async.run(function()
+            maki.async.sleep(50)
+            body:line("late highlight")
+        end)
+        return { llm_output = "ran", body = body }
+    end,
+})"#,
+        )
+        .unwrap();
+
+        let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+        let event_tx = maki_agent::EventSender::new(tx, 0);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+            &maki_agent::AgentMode::Build,
+            Some(&event_tx),
+            Some("exe-1"),
+        );
+        ctx.registry = Arc::clone(&reg);
+        let entry = reg.get("displayed").expect("tool registered");
+        let inv = entry.tool.parse(&serde_json::json!({})).unwrap();
+        let done = smol::block_on(async { inv.execute(&ctx).await });
+        let output = done.output.expect("handler ran");
+        assert_eq!(output.as_text(), "ran");
+
+        // The header callback never runs; dispatch gets the plain name.
+        let header = smol::block_on(async {
+            entry
+                .tool
+                .parse(&serde_json::json!({}))
+                .unwrap()
+                .start_header()
+                .await
+        });
+        assert_eq!(header.text(), "displayed");
+
+        // Let the async task the handler spawned finish, exactly like the
+        // highlighting an index call leaves behind.
+        smol::block_on(async { smol::Timer::after(std::time::Duration::from_millis(300)).await });
+
+        let events: Vec<maki_agent::AgentEvent> = rx.drain().map(|env| env.event).collect();
+        assert!(
+            events.is_empty(),
+            "a render event left an executor-side call: {events:?}"
+        );
+    }
+
+    /// The single-process host keeps the whole display contract the executor
+    /// drops: header callback, start preview, and the handler's body.
+    #[test]
+    fn single_process_host_keeps_the_display_half() {
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
+        host.load_source(
+            "t",
+            r#"
+maki.api.register_tool({
+    name = "displayed",
+    description = "d",
+    schema = { type = "object", properties = {} },
+    header = function() return "styled header" end,
+    start = function(input, ctx)
+        local buf = maki.ui.buf()
+        buf:line("preview")
+        ctx:live_buf(buf)
+    end,
+    handler = function(input, ctx)
+        local body = maki.ui.buf()
+        body:line("body line")
+        return { llm_output = "ran", body = body }
+    end,
+})"#,
+        )
+        .unwrap();
+
+        let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+        let event_tx = maki_agent::EventSender::new(tx, 0);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+            &maki_agent::AgentMode::Build,
+            Some(&event_tx),
+            Some("call-1"),
+        );
+        ctx.registry = Arc::clone(&reg);
+        let entry = reg.get("displayed").expect("tool registered");
+        let inv = entry.tool.parse(&serde_json::json!({})).unwrap();
+        let done = smol::block_on(async { inv.execute(&ctx).await });
+        assert_eq!(done.output.expect("handler ran").as_text(), "ran");
+
+        let header = smol::block_on(async {
+            entry
+                .tool
+                .parse(&serde_json::json!({}))
+                .unwrap()
+                .start_header()
+                .await
+        });
+        assert_eq!(header.text(), "styled header");
+
+        let events: Vec<maki_agent::AgentEvent> = rx.drain().map(|env| env.event).collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, maki_agent::AgentEvent::LiveToolBuf { .. })),
+            "the start preview must be published: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, maki_agent::AgentEvent::ToolSnapshot { .. })),
+            "the handler's body must be published: {events:?}"
+        );
+    }
+
     const PUSHED_PLUGIN: &str = r#"---@permissions run
 maki.api.register_tool({
     name = "pushed_one",

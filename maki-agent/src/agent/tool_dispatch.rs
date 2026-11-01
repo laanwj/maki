@@ -730,19 +730,25 @@ async fn run_native_tool(
         .registry
         .tool_view(&tool_id)
         .filter(|_| origin.is_model() && !entry.tool.has_own_display());
-    let (summary, render_header) = if let Some(view) = &view {
-        let header = (view.start)(ViewStart {
+    let (summary, render_header, view_body) = if let Some(view) = &view {
+        match (view.start)(ViewStart {
             call_id: Arc::from(id.as_str()),
             tool: Arc::clone(&tool_id),
             input: input.clone(),
             ctx: ctx.clone(),
         })
         .await
-        .unwrap_or_else(|| HeaderResult::plain(tool_id.to_string()));
-        (header.text(), header.snapshot())
+        {
+            Some(outcome) => (
+                outcome.header.text(),
+                outcome.header.snapshot(),
+                outcome.body,
+            ),
+            None => (tool_id.to_string(), None, None),
+        }
     } else {
         let header_result = invocation.start_header().await;
-        (header_result.text(), header_result.snapshot())
+        (header_result.text(), header_result.snapshot(), None)
     };
     let start = ToolStartEvent {
         id: id.clone(),
@@ -756,6 +762,15 @@ async fn run_native_tool(
     };
     if origin.is_model() {
         let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        // The body buf rides after the call's own announcement: published
+        // before it, a frame that polls between the two evicts it as an
+        // orphan and the row falls back to raw llm_output.
+        if let Some(body) = view_body {
+            let _ = ctx.event_tx.send(AgentEvent::LiveToolBuf {
+                id: id.clone(),
+                body,
+            });
+        }
     }
 
     invocation.start(ctx).await;
@@ -1094,14 +1109,18 @@ async fn execute_mcp_tool(
     // preview and the final body; the executor only executes.
     let view = ctx.registry.tool_view(&tool).filter(|_| origin.is_model());
     if let Some(view) = &view {
-        let header = (view.start)(ViewStart {
+        let outcome = (view.start)(ViewStart {
             call_id: Arc::from(id),
             tool: Arc::clone(&tool),
             input: input.clone(),
             ctx: ctx.clone(),
         })
-        .await
-        .unwrap_or_else(|| HeaderResult::plain(tool.to_string()));
+        .await;
+        let header = outcome
+            .as_ref()
+            .map(|o| o.header.clone())
+            .unwrap_or_else(|| HeaderResult::plain(tool.to_string()));
+        let body = outcome.and_then(|o| o.body);
         let summary = header.text();
         let start = ToolStartEvent {
             id: id.to_owned(),
@@ -1113,7 +1132,16 @@ async fn execute_mcp_tool(
             raw_input: Some(input.clone()),
             output: None,
         };
+        // The call's announcement precedes its body buf: a frame polling
+        // between the two would evict the buf as an orphan and the row
+        // would fall back to raw llm_output.
         let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+        if let Some(body) = body {
+            let _ = ctx.event_tx.send(AgentEvent::LiveToolBuf {
+                id: id.to_owned(),
+                body,
+            });
+        }
     } else {
         emit_raw_start(ctx, origin, id, &tool, routed.summary.clone(), input);
     }
@@ -2830,10 +2858,15 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(format!("start:{}", vs.input["code"].as_str().unwrap_or("")));
+                        let body = Arc::new(crate::SharedBuf::new());
+                        body.append(crate::SnapshotLine::plain("preview".into()));
                         Box::pin(async {
-                            Some(crate::tools::HeaderResult::plain(
-                                "custom header".to_owned(),
-                            ))
+                            Some(crate::tools::ViewStartOutcome {
+                                header: crate::tools::HeaderResult::plain(
+                                    "custom header".to_owned(),
+                                ),
+                                body: Some(body),
+                            })
                         })
                     }),
                     progress: Arc::new(|_, _| Box::pin(async {})),
@@ -2854,6 +2887,15 @@ mod tests {
                 panic!("expected ToolStart, got {:?}", envelope.event);
             };
             assert_eq!(start.summary, "custom header");
+            // The body buf follows the call's own announcement. Sent first, a
+            // frame polling between the two evicts it as an orphan and the
+            // row falls back to raw llm_output.
+            let envelope = rx.try_recv().expect("the body buf must be registered");
+            let AgentEvent::LiveToolBuf { id, body } = envelope.event else {
+                panic!("expected LiveToolBuf, got {:?}", envelope.event);
+            };
+            assert_eq!(id, start.id);
+            assert_eq!(body.take().text(), "preview");
             let calls = calls.lock().unwrap();
             assert_eq!(calls.len(), 2, "start and done, in order: {calls:?}");
             assert_eq!(calls[0], "start:print(1)");
@@ -2922,7 +2964,10 @@ mod tests {
                             .unwrap()
                             .push(format!("start:{}", vs.input["flag"].as_str().unwrap_or("")));
                         Box::pin(async {
-                            Some(crate::tools::HeaderResult::plain("view header".to_owned()))
+                            Some(crate::tools::ViewStartOutcome {
+                                header: crate::tools::HeaderResult::plain("view header".to_owned()),
+                                body: None,
+                            })
                         })
                     }),
                     progress: Arc::new(|_, _| Box::pin(async {})),

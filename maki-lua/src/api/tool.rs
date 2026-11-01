@@ -16,7 +16,8 @@ use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, vali
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    ToolReach, ViewDone, ViewHook, ViewStart, is_tool_enabled, timeout_annotation,
+    ToolReach, ViewDone, ViewHook, ViewStart, ViewStartOutcome, is_tool_enabled,
+    timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
@@ -861,25 +862,31 @@ fn register_tool_view(lua: &Lua, spec: Table) -> LuaResult<()> {
     let start_tool = Arc::clone(&tool_name);
     let start_hook = Arc::new(move |vs: ViewStart| {
         let (reply_tx, reply_rx) = flume::bounded(1);
-        let live = LiveCtx {
-            event_tx: vs.ctx.event_tx.clone(),
-            tool_use_id: vs.call_id.to_string(),
-        };
         let ctx = Box::new(crate::api::util::ctx::LuaCtx::start(&vs.ctx));
         let sent = start_tx.send(Request::ViewStart {
             tool: Arc::clone(&start_tool),
             call_id: vs.call_id,
             input: vs.input,
-            live,
             ctx,
             reply: reply_tx,
         });
+        let fallback_tool = Arc::clone(&start_tool);
         Box::pin(async move {
             if sent.is_err() {
                 return None;
             }
-            reply_rx.recv_async().await.ok().flatten()
-        }) as BoxFuture<'static, Option<HeaderResult>>
+            reply_rx
+                .recv_async()
+                .await
+                .ok()
+                .flatten()
+                .map(|r| ViewStartOutcome {
+                    header: r
+                        .header
+                        .unwrap_or_else(|| HeaderResult::plain(fallback_tool.to_string())),
+                    body: r.body,
+                })
+        }) as BoxFuture<'static, Option<ViewStartOutcome>>
     });
 
     let progress_tx = tx.clone();

@@ -8610,3 +8610,234 @@ fn ctrl_l_opens_model_picker() {
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
 }
+
+mod subagent_view_routing {
+    //! Full stack: a real Lua plugin host (global registry, like the brain's),
+    //! a subagent session whose model calls an MCP tool with a registered
+    //! view, the real relay, and the real App. Whatever chat the body buf
+    //! lands in is what the user sees: the subagent tab must render the view
+    //! body (the code), not fall back to truncated llm_output.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use maki_agent::mcp::error::McpError;
+    use maki_agent::mcp::test_support::session_with_transport;
+    use maki_agent::mcp::transport::{BoxFuture as McpFuture, McpTransport};
+    use maki_agent::tools::ToolRegistry;
+    use maki_agent::tools::test_support::stub_ctx_with;
+    use maki_agent::{AgentMode, Envelope, EventSender};
+    use maki_lua::{Interaction, PluginHost};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+        StopReason, StreamResponse, TokenUsage,
+    };
+    use maki_storage::id::SessionRef;
+    use serde_json::{Value, json};
+
+    use super::{App, Msg, test_app};
+
+    const PLUGIN: &str = "subagent_view_routing";
+    const TASK_TOOL: &str = "svr_task";
+    const MCP_TOOL: &str = "svrpy";
+    const TASK_CALL_ID: &str = "svr_call_1";
+    const MCP_CALL_ID: &str = "svr_py_1";
+    const RUN_ID: u64 = 7;
+    const CODE_LINE: &str = "CODE print('routing')";
+
+    /// The executor half: answers `tools/call` for the MCP tool.
+    struct FakeExecutor;
+
+    impl McpTransport for FakeExecutor {
+        fn send_request<'a>(
+            &'a self,
+            method: &'a str,
+            _params: Option<Value>,
+        ) -> McpFuture<'a, Result<Value, McpError>> {
+            let result = match method {
+                "tools/call" => json!({
+                    "content": [{ "type": "text", "text": "executor output line" }]
+                }),
+                _ => json!({}),
+            };
+            Box::pin(async move { Ok(result) })
+        }
+
+        fn send_notification<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<Value>,
+        ) -> McpFuture<'a, Result<(), McpError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown<'a>(&'a self) -> McpFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn server_name(&self) -> &Arc<str> {
+            static NAME: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+            NAME.get_or_init(|| Arc::from("executor"))
+        }
+
+        fn transport_kind(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// First request: the MCP tool call. Every later one: plain text.
+    struct CallToolOnce {
+        asked: AtomicBool,
+    }
+
+    impl Provider for CallToolOnce {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _events: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let (block, stop) = if self.asked.swap(true, Ordering::SeqCst) {
+                (
+                    ContentBlock::Text {
+                        text: "subagent done".into(),
+                    },
+                    StopReason::EndTurn,
+                )
+            } else {
+                (
+                    ContentBlock::tool_use(
+                        MCP_CALL_ID,
+                        MCP_TOOL,
+                        json!({ "code": "print('routing')" }),
+                    ),
+                    StopReason::ToolUse,
+                )
+            };
+            Box::pin(async move {
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![block],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(stop),
+                    input_transformations: Vec::new(),
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    const PLUGIN_SRC: &str = r#"
+maki.api.register_tool_view({
+  tool = "svrpy",
+  start = function(input, ctx)
+    local buf = maki.ui.buf()
+    buf:set_lines({ "CODE " .. (input.code or "?") })
+    ctx:live_buf(buf)
+    return { buf = buf }, "1 lines of svrpy"
+  end,
+  done = function(state, input, output)
+    state.buf:line({ { "done", "dim" } })
+  end,
+})
+
+maki.api.register_tool({
+  name = "svr_task",
+  description = "spawn a subagent that calls the MCP tool once",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function(input, ctx)
+    local sess, err = maki.agent.session(ctx, {
+      tools = {
+        {
+          name = "svrpy",
+          description = "run a script",
+          input_schema = {
+            type = "object",
+            properties = { code = { type = "string" } },
+            required = { "code" },
+          },
+        },
+      },
+      mcp = true,
+    })
+    if err then
+      return { llm_output = err, is_error = true }
+    end
+    local r, perr = sess:prompt("go")
+    sess:close()
+    if perr then
+      return { llm_output = perr, is_error = true }
+    end
+    return r.text
+  end,
+})
+"#;
+
+    fn rendered_subagent_tab(app: &mut App) -> String {
+        app.focus_task(TASK_CALL_ID).expect("subagent chat exists");
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                app.view(frame);
+            })
+            .unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn subagent_view_body_lands_in_the_subagent_chat() {
+        let reg = Arc::clone(ToolRegistry::global_arc());
+        let host = PluginHost::start(Arc::clone(&reg), Interaction::Tty, true).unwrap();
+        host.load_source(PLUGIN, PLUGIN_SRC).unwrap();
+
+        let (parent_tx, parent_rx) = flume::unbounded::<Envelope>();
+        let event_tx = EventSender::new(parent_tx, RUN_ID);
+        let mcp = session_with_transport(&[(MCP_TOOL, "run a script")], Arc::new(FakeExecutor));
+
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(TASK_CALL_ID));
+        ctx.registry = Arc::clone(&reg);
+        ctx.mcp = Some(mcp);
+        ctx.provider = Arc::new(CallToolOnce {
+            asked: AtomicBool::new(false),
+        });
+        ctx.model = Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap());
+
+        let entry = reg.get(TASK_TOOL).expect("task tool registered");
+        let inv = entry.tool.parse(&json!({})).expect("parse failed");
+        let done = smol::block_on(async { inv.execute(&ctx).await });
+        host.unload(PLUGIN).unwrap();
+        let output = done
+            .output
+            .as_ref()
+            .map(|o| o.as_text())
+            .unwrap_or_default();
+        assert!(output.contains("subagent done"), "task failed: {output}");
+
+        // Feed the captured parent stream to the real App the way the event
+        // loop does, then poll like a frame would.
+        let mut app = test_app();
+        app.run_id = RUN_ID;
+        for envelope in parent_rx.drain() {
+            app.update(Msg::Agent(Box::new(envelope)));
+        }
+        let _ = app.tick();
+
+        let screen = rendered_subagent_tab(&mut app);
+        assert!(
+            screen.contains(CODE_LINE),
+            "the subagent tab must show the view body (the code); got:\n{screen}"
+        );
+    }
+}

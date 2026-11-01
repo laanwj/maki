@@ -15,7 +15,7 @@ use maki_config::Permission;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolOutput};
+use crate::{BufferSnapshot, SharedBuf, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
@@ -295,13 +295,23 @@ pub struct ToolRegistry {
 pub type InstalledHook = Arc<Box<dyn ToolHook>>;
 pub type InstalledAgentHook = Arc<Box<dyn AgentHook>>;
 
+/// What a view's `start` produced: the header for the call's row and the
+/// body buf it published. The body rides the reply instead of the event
+/// stream so the dispatcher can announce the call first: a `LiveToolBuf`
+/// that precedes its own `ToolStart` reads as an orphan on a frame that
+/// polls between the two, and gets evicted.
+pub struct ViewStartOutcome {
+    pub header: HeaderResult,
+    pub body: Option<Arc<SharedBuf>>,
+}
+
 /// Lifecycle of one view invocation: `start` paints the preview and reports
-/// the header (plain text or a styled snapshot), `progress` consumes the
-/// tool's structured payloads, `done` paints the final body from the result
-/// text.
+/// the header (plain text or a styled snapshot) plus the body buf,
+/// `progress` consumes the tool's structured payloads, `done` paints the
+/// final body from the result text.
 #[derive(Clone)]
 pub struct ViewHook {
-    pub start: Arc<dyn Fn(ViewStart) -> BoxFuture<'static, Option<HeaderResult>> + Send + Sync>,
+    pub start: Arc<dyn Fn(ViewStart) -> BoxFuture<'static, Option<ViewStartOutcome>> + Send + Sync>,
     pub progress: Arc<dyn Fn(Arc<str>, Value) -> BoxFuture<'static, ()> + Send + Sync>,
     pub done: Arc<dyn Fn(ViewDone) -> BoxFuture<'static, ()> + Send + Sync>,
 }

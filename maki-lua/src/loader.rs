@@ -1850,7 +1850,7 @@ mod tests {
             })
             .await;
             assert_eq!(
-                summary.map(|h| h.text()),
+                summary.map(|h| h.header.text()),
                 Some("starting python".to_owned())
             );
             (view.progress)(Arc::from("c1"), serde_json::json!("a line")).await;
@@ -1930,12 +1930,15 @@ mod tests {
                 ctx,
             })
             .await;
-            let header = summary.expect("view start must report a header");
-            assert_eq!(header.text(), "8 lines of python in .venv");
+            let outcome = summary.expect("view start must report a header");
+            assert_eq!(outcome.header.text(), "8 lines of python in .venv");
             assert!(
-                header.snapshot().is_some(),
+                outcome.header.snapshot().is_some(),
                 "a buf header must carry a snapshot"
             );
+            let body = outcome.body.expect("ctx:live_buf must ride the reply");
+            let text = body.take().text();
+            assert!(text.contains("body line"), "got {text:?}");
         });
     }
 
@@ -1985,29 +1988,20 @@ mod tests {
             for i in 0..=crate::runtime::WARM_TOOL_CAP {
                 let id = format!("view-{i}");
                 let call_id: Arc<str> = Arc::from(id.as_str());
-                let (tx, rx) = flume::unbounded();
-                let event_tx = maki_agent::EventSender::new(tx, 0);
                 let ctx = maki_agent::tools::test_support::stub_ctx_with(
                     &maki_agent::AgentMode::Build,
-                    Some(&event_tx),
+                    None,
                     None,
                 );
-                (view.start)(maki_agent::tools::ViewStart {
+                let body = (view.start)(maki_agent::tools::ViewStart {
                     call_id: Arc::clone(&call_id),
                     tool: Arc::from("python"),
                     input: serde_json::json!({}),
                     ctx,
                 })
-                .await;
-                let body = rx
-                    .drain()
-                    .find_map(|env| match env.event {
-                        maki_agent::AgentEvent::LiveToolBuf { id: got, body } if got == id => {
-                            Some(body)
-                        }
-                        _ => None,
-                    })
-                    .expect("live view buf");
+                .await
+                .and_then(|o| o.body)
+                .expect("live view buf");
                 bufs.push(body);
                 (view.progress)(Arc::clone(&call_id), serde_json::json!({})).await;
                 (view.done)(maki_agent::tools::ViewDone {
@@ -2063,27 +2057,20 @@ mod tests {
 
         let body = smol::block_on(async {
             let call_id: Arc<str> = Arc::from("large-view");
-            let (tx, rx) = flume::unbounded();
-            let event_tx = maki_agent::EventSender::new(tx, 0);
             let ctx = maki_agent::tools::test_support::stub_ctx_with(
                 &maki_agent::AgentMode::Build,
-                Some(&event_tx),
+                None,
                 None,
             );
-            (view.start)(maki_agent::tools::ViewStart {
+            let body = (view.start)(maki_agent::tools::ViewStart {
                 call_id: Arc::clone(&call_id),
                 tool: Arc::from("python"),
                 input: serde_json::json!({}),
                 ctx,
             })
-            .await;
-            let body = rx
-                .drain()
-                .find_map(|env| match env.event {
-                    maki_agent::AgentEvent::LiveToolBuf { body, .. } => Some(body),
-                    _ => None,
-                })
-                .expect("live view buf");
+            .await
+            .and_then(|o| o.body)
+            .expect("live view buf");
             (view.done)(maki_agent::tools::ViewDone {
                 call_id,
                 input: serde_json::json!({}),
@@ -2135,27 +2122,20 @@ mod tests {
 
         let body = smol::block_on(async {
             let call_id: Arc<str> = Arc::from("overlapping-view");
-            let (tx, rx) = flume::unbounded();
-            let event_tx = maki_agent::EventSender::new(tx, 0);
             let ctx = maki_agent::tools::test_support::stub_ctx_with(
                 &maki_agent::AgentMode::Build,
-                Some(&event_tx),
+                None,
                 None,
             );
-            (view.start)(maki_agent::tools::ViewStart {
+            let body = (view.start)(maki_agent::tools::ViewStart {
                 call_id: Arc::clone(&call_id),
                 tool: Arc::from("python"),
                 input: serde_json::json!({}),
                 ctx,
             })
-            .await;
-            let body = rx
-                .drain()
-                .find_map(|env| match env.event {
-                    maki_agent::AgentEvent::LiveToolBuf { body, .. } => Some(body),
-                    _ => None,
-                })
-                .expect("live view buf");
+            .await
+            .and_then(|o| o.body)
+            .expect("live view buf");
             let progress = (view.progress)(Arc::clone(&call_id), serde_json::json!({}));
             let done = (view.done)(maki_agent::tools::ViewDone {
                 call_id,

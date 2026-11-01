@@ -560,9 +560,8 @@ pub enum Request {
         tool: Arc<str>,
         call_id: Arc<str>,
         input: Value,
-        live: LiveCtx,
         ctx: Box<LuaCtx>,
-        reply: flume::Sender<Option<HeaderResult>>,
+        reply: flume::Sender<Option<ViewStartReply>>,
     },
     ViewProgress {
         call_id: Arc<str>,
@@ -807,6 +806,15 @@ impl RestoreReply {
 pub struct LiveCtx {
     pub event_tx: maki_agent::EventSender,
     pub tool_use_id: String,
+}
+
+/// What a view's `start` hands back to dispatch. The body buf rides the
+/// reply instead of going out as a `LiveToolBuf` from inside the callback:
+/// dispatch emits the call's `ToolStart` first, so a frame polling between
+/// the two can never read the buf as an orphan and evict it.
+pub struct ViewStartReply {
+    pub header: Option<HeaderResult>,
+    pub body: Option<Arc<maki_agent::SharedBuf>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4566,13 +4574,14 @@ fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
 /// runtime hands to progress/done, and an optional header result, built from
 /// a plain string or a buf the same way a tool's `header` return is. The task
 /// handle and claim come back so clicks route to the view's bufs for the
-/// call's whole life, the way a native tool's would.
+/// call's whole life, the way a native tool's would. The cell carries no
+/// `LiveCtx`: `ctx:live_buf` still records the body buf on the task, but the
+/// event goes out from dispatch, after the `ToolStart` it follows.
 async fn run_view_start(
     lua: &Lua,
     func: Function,
     tool: &str,
     input: Value,
-    live: LiveCtx,
     ctx: Box<LuaCtx>,
 ) -> (
     Option<RegistryKey>,
@@ -4580,7 +4589,7 @@ async fn run_view_start(
     TaskHandle,
     Arc<BufsClaim>,
 ) {
-    let scope = TaskScope::new(lua, TaskCell::new(ctx.cancel.clone(), None, Some(live)));
+    let scope = TaskScope::new(lua, TaskCell::new(ctx.cancel.clone(), None, None));
     let handle = Arc::clone(scope.handle());
     let claim = scope.bufs_claim();
     let run = async {
@@ -5302,7 +5311,6 @@ pub fn spawn(
                             tool,
                             call_id,
                             input,
-                            live,
                             ctx,
                             reply,
                         } => {
@@ -5319,12 +5327,18 @@ pub fn spawn(
                             let g = Rc::clone(&gate);
                             ex.spawn(async move {
                                 let slot = Some(g.acquire().await);
-                                let (state, summary, handle, claim) =
-                                    covered(slot, run_view_start(&lua, func, &tool, input, live, ctx))
-                                        .await;
+                                let (state, header, handle, claim) = covered(
+                                    slot,
+                                    run_view_start(&lua, func, &tool, input, ctx),
+                                )
+                                .await;
                                 live_tasks
                                     .borrow_mut()
                                     .insert(call_id.to_string(), Arc::clone(&handle));
+                                // The body the view published with ctx:live_buf,
+                                // recorded on its task. Dispatch sends it as the
+                                // LiveToolBuf, after the ToolStart it emits first.
+                                let body = lock_cell(&handle).root_buf.clone();
                                 if let Some(mut store) = lua.app_data_mut::<ToolViewStore>() {
                                     store.active.insert(
                                         call_id,
@@ -5337,7 +5351,7 @@ pub fn spawn(
                                         },
                                     );
                                 }
-                                let _ = reply.send(summary);
+                                let _ = reply.send(Some(ViewStartReply { header, body }));
                             })
                             .detach();
                         }

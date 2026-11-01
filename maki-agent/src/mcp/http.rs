@@ -18,7 +18,7 @@ use smol::lock::Mutex;
 use super::error::McpError;
 use super::oauth;
 use super::protocol::{JsonRpcError, JsonRpcNotification, JsonRpcRequest};
-use super::transport::{BoxFuture, CancelNotify, McpTransport};
+use super::transport::{self, BoxFuture, CancelNotify, McpTransport};
 use tracing::{info, warn};
 
 const MAX_REDIRECTS: u32 = 10;
@@ -39,6 +39,7 @@ pub struct HttpTransport {
     storage: Option<StateDir>,
     ca_file: Option<PathBuf>,
     negotiated: Arc<Mutex<Negotiated>>,
+    session_recovery: Mutex<()>,
     next_id: AtomicU64,
 }
 
@@ -116,6 +117,7 @@ impl HttpTransport {
             storage,
             ca_file: ca_file.map(Path::to_path_buf),
             negotiated: Arc::new(Mutex::new(Negotiated::default())),
+            session_recovery: Mutex::new(()),
             next_id: AtomicU64::new(1),
         })
     }
@@ -223,6 +225,24 @@ impl HttpTransport {
         }
     }
 
+    async fn recover_session(&self, stale: &Negotiated) -> Result<(), McpError> {
+        let _recovery = self.session_recovery.lock().await;
+        {
+            let current = self.negotiated.lock().await;
+            if current.session_id.is_some() && current.session_id != stale.session_id {
+                return Ok(());
+            }
+        }
+
+        *self.negotiated.lock().await = Negotiated::default();
+        info!(server = %self.name, "MCP HTTP session not found; reinitializing");
+        if let Err(error) = transport::initialize(self).await {
+            *self.negotiated.lock().await = Negotiated::default();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// This transport's [`CancelNotify`]: one best-effort POST of the cancel
     /// notification, reading the live auth and session state at fire time so
     /// a mid-request token refresh is not missed.
@@ -293,6 +313,7 @@ impl McpTransport for HttpTransport {
 
             let mut auth = self.auth.lock().await.clone();
             let mut refreshed = false;
+            let mut recovered = false;
 
             // Armed until a reply for our id lands; the 401 retry re-POSTs the
             // same id under the same guard.
@@ -312,6 +333,13 @@ impl McpTransport for HttpTransport {
                     auth = Some(new_auth);
                     refreshed = true;
 
+                    continue;
+                }
+
+                if status == StatusCode::NOT_FOUND && negotiated.session_id.is_some() && !recovered
+                {
+                    self.recover_session(&negotiated).await?;
+                    recovered = true;
                     continue;
                 }
 
@@ -586,6 +614,10 @@ mod tests {
     const NEW_BEARER: &str = "Bearer new-token";
     const DISCONNECT_DEADLINE: Duration = Duration::from_secs(5);
     const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    const EXPIRED_SESSION: &str = "expired-session";
+    const NEW_SESSION: &str = "new-session";
+    const SESSION_NOT_FOUND: &str =
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Session not found"}}"#;
     const PARTIAL_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{";
 
     enum PendingOperation {
@@ -788,6 +820,19 @@ mod tests {
     where
         F: Fn(&Req) -> (u16, String) + Send + Sync + 'static,
     {
+        spawn_server_with_headers(move |base| {
+            let handler = make_handler(base);
+            move |req| {
+                let (status, body) = handler(req);
+                (status, Vec::new(), body)
+            }
+        })
+    }
+
+    fn spawn_server_with_headers<F>(make_handler: impl FnOnce(String) -> F) -> String
+    where
+        F: Fn(&Req) -> (u16, Vec<(String, String)>, String) + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handler = Arc::new(make_handler(base.clone()));
@@ -838,16 +883,20 @@ mod tests {
                     let mut body = vec![0u8; content_length];
                     let _ = std::io::Read::read_exact(&mut reader, &mut body);
 
-                    let (status, resp_body) = handler(&Req {
+                    let (status, extra_headers, resp_body) = handler(&Req {
                         path,
                         auth,
                         protocol,
                         headers,
                         body: String::from_utf8_lossy(&body).into_owned(),
                     });
+                    let extra_headers = extra_headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>();
 
                     let response = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
                         resp_body.len(),
                     );
                     let _ = stream.write_all(response.as_bytes());
@@ -880,6 +929,95 @@ mod tests {
         storage: Option<StateDir>,
     ) -> HttpTransport {
         HttpTransport::new("srv", url, &headers, Some(TRANSPORT_TIMEOUT), storage, None).unwrap()
+    }
+
+    #[test]
+    fn expired_session_reinitializes_and_retries_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let initializations = Arc::new(AtomicUsize::new(0));
+        let initialized_notifications = Arc::new(AtomicUsize::new(0));
+        let base = spawn_server_with_headers({
+            let calls = Arc::clone(&calls);
+            let initializations = Arc::clone(&initializations);
+            let initialized_notifications = Arc::clone(&initialized_notifications);
+            move |_| {
+                move |req: &Req| {
+                    let msg: Value = serde_json::from_str(&req.body).unwrap();
+                    let session = req.headers.get(SESSION_HEADER).map(String::as_str);
+                    match msg["method"].as_str() {
+                        Some("initialize") => {
+                            initializations.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(session, None);
+                            let id = msg["id"].as_u64().unwrap();
+                            (
+                                200,
+                                vec![(SESSION_HEADER.to_string(), NEW_SESSION.to_string())],
+                                format!(
+                                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"{NEGOTIATED_VERSION}"}}}}"#
+                                ),
+                            )
+                        }
+                        Some("notifications/initialized") => {
+                            initialized_notifications.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(session, Some(NEW_SESSION));
+                            (202, Vec::new(), String::new())
+                        }
+                        Some("tools/call") => {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let id = msg["id"].as_u64().unwrap();
+                            match session {
+                                Some(EXPIRED_SESSION) => {
+                                    (404, Vec::new(), SESSION_NOT_FOUND.to_string())
+                                }
+                                Some(NEW_SESSION) => (200, Vec::new(), rpc_ok(id)),
+                                _ => panic!("unexpected session: {session:?}"),
+                            }
+                        }
+                        method => panic!("unexpected method: {method:?}"),
+                    }
+                }
+            }
+        });
+
+        let transport = transport_with(&format!("{base}/mcp"), HashMap::new(), None);
+        let result = smol::block_on(async {
+            *transport.negotiated.lock().await = Negotiated {
+                session_id: Some(EXPIRED_SESSION.to_string()),
+                protocol_version: None,
+            };
+            transport.send_request("tools/call", None).await
+        })
+        .unwrap();
+
+        assert_eq!(result, json!({"ok": true}));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(initializations.load(Ordering::SeqCst), 1);
+        assert_eq!(initialized_notifications.load(Ordering::SeqCst), 1);
+        let negotiated = smol::block_on(transport.negotiated.lock()).clone();
+        assert_eq!(negotiated.session_id.as_deref(), Some(NEW_SESSION));
+        assert_eq!(
+            negotiated.protocol_version.as_deref(),
+            Some(NEGOTIATED_VERSION)
+        );
+    }
+
+    #[test]
+    fn not_found_without_session_is_not_retried() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let base = spawn_server({
+            let hits = Arc::clone(&hits);
+            move |_| {
+                move |_req: &Req| {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (404, SESSION_NOT_FOUND.to_string())
+                }
+            }
+        });
+
+        let transport = transport_with(&format!("{base}/mcp"), HashMap::new(), None);
+        let error = smol::block_on(transport.send_request("initialize", None)).unwrap_err();
+        assert!(matches!(error, McpError::HttpError { status: 404, .. }));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test_case("missing.pem" ; "missing_file")]
